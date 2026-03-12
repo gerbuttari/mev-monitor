@@ -65,7 +65,7 @@ function isDateStr(s) {
   return parts[0].length === 2 && parts[1].length === 2 && parts[2].length === 4 && !isNaN(Number(parts[0])) && !isNaN(Number(parts[1])) && !isNaN(Number(parts[2]));
 }
 
-function pd(s) {
+function pd(s) { if (!s) return null; var iso = s.match(/^(\d{4})-(\d{2})-(\d{2})$/); if (iso) return new Date(+iso[1],+iso[2]-1,+iso[3]); var arg = s.match(/(\d{2})\/(\d{2})\/(\d{4})/); return arg ? new Date(+arg[3],+arg[2]-1,+arg[1]) : null; }
   if (!isDateStr(s)) return null;
   const p = s.split('/');
   return new Date(Number(p[2]), Number(p[1]) - 1, Number(p[0]));
