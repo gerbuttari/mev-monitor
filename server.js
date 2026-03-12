@@ -10,6 +10,8 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const BASE = 'https://mev.scba.gov.ar';
+
+// Returns { cookie, homeHtml, homeUrl }
 async function mevLogin(usuario, clave) {
   const hdrs = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
@@ -31,7 +33,7 @@ async function mevLogin(usuario, clave) {
     {
       timeout: 30000,
       maxRedirects: 10,
-      validateStatus: s => s < 500,
+      validateStatus: () => true, // Accept all status codes including 500
       headers: Object.assign({}, hdrs, {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Cookie': c1,
@@ -50,20 +52,26 @@ async function mevLogin(usuario, clave) {
   const body = (r2.data || '').toString();
   const lower = body.toLowerCase();
 
-  if (lower.includes('clave incorrecta') || lower.includes('usuario incorrecto') || lower.includes('datos incorrectos')) {
-    throw new Error('Credenciales incorrectas.');
+  if (r2.status >= 500) {
+    throw new Error('Credenciales incorrectas. Verifique usuario y clave.');
+  }
+  if (lower.includes('clave incorrecta') || lower.includes('usuario incorrecto') || lower.includes('datos incorrectos') || lower.includes('acceso denegado')) {
+    throw new Error('Credenciales incorrectas. Verifique usuario y clave.');
   }
 
+  // The post-login page IS the home/menu â use it directly
   const homeUrl = r2.request ? (r2.request.res ? r2.request.res.responseUrl : '') : '';
   console.log('[MEV] Post-login URL: ' + (homeUrl || 'unknown'));
   console.log('[MEV] Post-login body length: ' + body.length);
 
   return { cookie: allC, homeHtml: body, homeUrl };
 }
+
 function extractOrganismos(html) {
   const $ = cheerio.load(html);
   const orgs = [];
 
+  // Strategy 1: select/option with org codes
   $('select option').each((_, el) => {
     const v = $(el).attr('value');
     const t = $(el).text().trim();
@@ -73,6 +81,7 @@ function extractOrganismos(html) {
   });
   if (orgs.length > 0) return orgs;
 
+  // Strategy 2: links with nidOrganismo
   $('a').each((_, el) => {
     const href = $(el).attr('href') || '';
     const m = href.match(/nidOrganismo=([^&]+)/i);
@@ -80,6 +89,7 @@ function extractOrganismos(html) {
   });
   if (orgs.length > 0) return orgs;
 
+  // Strategy 3: links with organismo
   $('a').each((_, el) => {
     const href = $(el).attr('href') || '';
     const m = href.match(/[Oo]rganismo=([^&]+)/);
@@ -90,12 +100,14 @@ function extractOrganismos(html) {
 }
 
 async function getOrganismos(cookie, homeHtml) {
+  // First try to parse from the home page we already have
   let orgs = extractOrganismos(homeHtml);
   if (orgs.length > 0) {
     console.log('[MEV] Organismos from home page: ' + orgs.length);
     return orgs;
   }
 
+  // Try known menu URLs
   const menuUrls = [
     '/inicio.asp', '/ingreso.asp', '/menu.asp',
     '/causas.asp', '/principal.asp', '/home.asp', '/index.asp'
@@ -123,6 +135,7 @@ async function getOrganismos(cookie, homeHtml) {
 
   return [];
 }
+
 async function getCausas(cookie, orgId) {
   const r = await axios.get(BASE + '/causas.asp?nidOrganismo=' + orgId, {
     timeout: 90000,
@@ -184,6 +197,7 @@ function inRange(dateStr, desde, hasta) {
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 async function scanMEV(opts) {
   console.log('[MEV] Login...');
   const { cookie, homeHtml } = await mevLogin(opts.usuario, opts.clave);
@@ -231,6 +245,7 @@ async function scanMEV(opts) {
 
   return { total: todas.length, conNovedades: detalladas.length, emailEnviado: detalladas.length > 0 };
 }
+
 async function sendEmail(causas, to, desde, hasta, cfg) {
   const t = nodemailer.createTransport({
     host: cfg.host, port: cfg.port || 587,
@@ -239,7 +254,7 @@ async function sendEmail(causas, to, desde, hasta, cfg) {
   });
   await t.sendMail({
     from: '"MEV Monitor" <' + cfg.user + '>',
-    to, subject: 'Novedades MEV \u2014 ' + desde + ' al ' + hasta,
+    to, subject: 'Novedades MEV â ' + desde + ' al ' + hasta,
     html: buildHtml(causas, desde, hasta)
   });
 }
@@ -260,11 +275,12 @@ function buildHtml(causas, desde, hasta) {
   }).join('');
   return '<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;padding:20px">' +
     '<div style="background:#1a237e;color:white;padding:18px;border-radius:8px 8px 0 0">' +
-    '<h2 style="margin:0">Novedades MEV</h2><p style="margin:4px 0 0;opacity:.8;font-size:13px">Periodo: ' + desde + ' \u2014 ' + hasta + '</p></div>' +
+    '<h2 style="margin:0">Novedades MEV</h2><p style="margin:4px 0 0;opacity:.8;font-size:13px">Periodo: ' + desde + ' â ' + hasta + '</p></div>' +
     '<div style="background:#e8eaf6;padding:10px 18px;margin-bottom:16px;border-radius:0 0 8px 8px">' +
     '<strong>' + causas.length + '</strong> causa' + (causas.length!==1?'s':'') + ' con novedades</div>' +
     rows + '</body></html>';
 }
+
 const jobs = {};
 function formatDate(d) {
   return String(d.getDate()).padStart(2,'0') + '/' + String(d.getMonth()+1).padStart(2,'0') + '/' + d.getFullYear();
