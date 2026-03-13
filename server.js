@@ -1,5 +1,7 @@
 const express = require('express');
 const axios = require('axios');
+const { wrapper } = require('axios-cookiejar-support');
+const { CookieJar } = require('tough-cookie');
 const cheerio = require('cheerio');
 const nodemailer = require('nodemailer');
 const path = require('path');
@@ -11,300 +13,160 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const BASE = 'https://mev.scba.gov.ar';
 
-// Departamentos judiciales de la SCBA
-const DEPTOS = [
-  { id: '6',  nombre: 'La Plata' },
-  { id: '10', nombre: 'Azul' },
-  { id: '11', nombre: 'Bahia Blanca' },
-  { id: '12', nombre: 'Dolores' },
-  { id: '13', nombre: 'Junin' },
-  { id: '14', nombre: 'La Matanza' },
-  { id: '16', nombre: 'Lomas de Zamora' },
-  { id: '17', nombre: 'Mar del Plata' },
-  { id: '18', nombre: 'Mercedes' },
-  { id: '19', nombre: 'Moron' },
-  { id: '20', nombre: 'Necochea' },
-  { id: '21', nombre: 'Olavarria' },
-  { id: '22', nombre: 'Pergamino' },
-  { id: '23', nombre: 'Quilmes' },
-  { id: '24', nombre: 'San Isidro' },
-  { id: '25', nombre: 'San Martin' },
-  { id: '26', nombre: 'San Nicolas' },
-  { id: '27', nombre: 'Tandil' },
-  { id: '28', nombre: 'Trenque Lauquen' },
-  { id: '29', nombre: 'Zarate/Campana' },
-  { id: '49', nombre: 'Tres Arroyos' },
-  { id: '52', nombre: 'Moreno - Gral. Rodriguez' },
-  { id: '80', nombre: 'Avellaneda-Lanus' },
-];
+function createClient() {
+  const jar = new CookieJar();
+  const client = wrapper(axios.create({
+    jar,
+    withCredentials: true,
+    timeout: 60000,
+    maxRedirects: 10,
+    validateStatus: () => true,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'es-AR,es;q=0.9',
+    }
+  }));
+  return client;
+}
 
-async function mevLogin(usuario, clave) {
-  const hdrs = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'es-AR,es;q=0.9'
-  };
-
-  // GET login page to get initial cookie
-  const r1 = await axios.get(BASE + '/loguin.asp', { timeout: 30000, headers: hdrs });
-  const c1 = (r1.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
-
-  // POST login
+async function mevLogin(client, usuario, clave) {
+  console.log('[MEV] GET loguin.asp...');
+  await client.get(BASE + '/loguin.asp');
+  console.log('[MEV] POST login...');
   const params = new URLSearchParams();
   params.append('usuario', usuario);
   params.append('clave', clave);
   params.append('DeptoRegistrado', 'aa');
-
-  const r2 = await axios.post(BASE + '/loguin.asp?familiadepto=', params.toString(), {
-    timeout: 30000,
-    maxRedirects: 10,
-    validateStatus: () => true,
-    headers: Object.assign({}, hdrs, {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Cookie': c1,
-      'Referer': BASE + '/loguin.asp',
-      'Origin': BASE
-    })
-  });
-
-  const c2 = (r2.headers['set-cookie'] || []).map(c => c.split(';')[0]);
-  const cookie = [...c1.split('; '), ...c2]
-    .filter(Boolean)
-    .filter((v, i, a) => a.findIndex(x => x.split('=')[0] === v.split('=')[0]) === i)
-    .join('; ');
-
+  const r2 = await client.post(BASE + '/loguin.asp?familiadepto=', params.toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': BASE + '/loguin.asp' } });
+  const finalUrl = r2.request?.res?.responseUrl || r2.config?.url || '';
   const body = (r2.data || '').toString();
   const lower = body.toLowerCase();
-  const finalUrl = r2.request?.res?.responseUrl || '';
-
-  console.log('[MEV] Login -> status=' + r2.status + ' url=' + finalUrl);
-
-  // Check for login failure
-  if (finalUrl.includes('AvisoERROR') || finalUrl.includes('error') ||
-      lower.includes('clave incorrecta') || lower.includes('usuario incorrecto') ||
-      lower.includes('usuario o clave inv') || lower.includes('datos incorrectos')) {
-    throw new Error('Credenciales incorrectas. VerificÃ¡ usuario y clave en la MEV.');
+  console.log('[MEV] Login response URL: ' + finalUrl);
+  if (finalUrl.includes('AvisoERROR') || finalUrl.includes('Error') || lower.includes('clave incorrecta') || lower.includes('usuario o clave') || lower.includes('datos incorrectos')) {
+    throw new Error('Credenciales incorrectas. Verific\u00e1 usuario y clave en la MEV.');
   }
-
-  // If we're NOT on POSLoguin.asp, something went wrong
-  if (!finalUrl.includes('POSLoguin') && !body.includes('POSLoguin') && !body.includes('Organismo')) {
-    if (finalUrl && !finalUrl.includes('loguin')) {
-      console.log('[MEV] Unexpected redirect to: ' + finalUrl);
-    }
-    if (r2.status >= 400) {
-      throw new Error('Credenciales incorrectas. VerificÃ¡ usuario y clave en la MEV.');
-    }
+  if (!finalUrl.includes('POSLoguin') && !body.includes('POSLoguin') && !body.includes('Seleccione el Organismo')) {
+    if (r2.status >= 400) throw new Error('Error al iniciar sesi\u00f3n (HTTP ' + r2.status + ')');
   }
-
-  console.log('[MEV] Login OK, cookie length=' + cookie.length);
-  return cookie;
+  console.log('[MEV] Login OK');
+  return body;
 }
 
-async function getCausasDepto(cookie, deptoId, deptoNombre) {
-  const hdrs = {
-    'Cookie': cookie,
-    'User-Agent': 'Mozilla/5.0',
-    'Referer': BASE + '/POSLoguin.asp'
-  };
-
-  // POST to POSLoguin.asp to select departamento
+async function selectDepto(client, posLoguinHtml, deptoId) {
   const params = new URLSearchParams();
   params.append('TipoDto', 'CC');
   params.append('DtoJudElegido', deptoId);
   params.append('Aceptar', 'Aceptar');
-
-  const r = await axios.post(BASE + '/POSLoguin.asp', params.toString(), {
-    timeout: 60000,
-    maxRedirects: 5,
-    validateStatus: () => true,
-    headers: Object.assign({}, hdrs, {
-      'Content-Type': 'application/x-www-form-urlencoded'
-    })
-  });
-
+  const r = await client.post(BASE + '/POSLoguin.asp', params.toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': BASE + '/POSLoguin.asp' } });
   const finalUrl = r.request?.res?.responseUrl || '';
-  console.log('[MEV] Depto ' + deptoNombre + ' -> status=' + r.status + ' url=' + finalUrl);
-
-  return r.data ? r.data.toString() : '';
+  console.log('[MEV] Select depto -> ' + finalUrl);
+  return (r.data || '').toString();
 }
 
-function parseCausas(html, deptoNombre) {
+function parseSets(html) {
+  const $ = cheerio.load(html);
+  const sets = [];
+  $('select[name=SetNovedades] option').each((_, el) => {
+    const val = $(el).attr('value');
+    const txt = $(el).text().trim();
+    if (val && val.trim() !== '') sets.push({ id: val.trim(), nombre: txt });
+  });
+  return sets;
+}
+
+async function getResultados(client, nidset, desde, hasta) {
+  const url = `${BASE}/resultados.asp?nidset=${nidset}&sfechadesde=${encodeURIComponent(desde)}&sfechahasta=${encodeURIComponent(hasta)}&pOrden=xCa&pOrdenAD=Asc`;
+  const r = await client.get(url, { headers: { 'Referer': BASE + '/Busqueda.asp' } });
+  return (r.data || '').toString();
+}
+
+function parseResultados(html, setNombre) {
   const $ = cheerio.load(html);
   const causas = [];
-
-  $('table tr').each((_, row) => {
-    const cells = $(row).find('td');
-    const link = $(row).find('a[href*="nidCausa"], a[href*="NIDCausa"]').first();
-    if (!link.length) return;
-    const href = link.attr('href') || '';
-    const m = href.match(/[nN][iI][dD][cC]ausa=([^&]+)/i);
-    if (!m) return;
-    const ultimaNovedad = cells.last().text().trim();
-    causas.push({
-      nidCausa: m[1].trim(),
-      caratula: cells.eq(0).text().trim() || link.text().trim(),
-      juzgado: cells.eq(1).text().trim(),
-      ultimaNovedad,
-      depto: deptoNombre
-    });
-  });
-
-  return causas;
-}
-
-async function getActuaciones(cookie, nid) {
-  const r = await axios.get(BASE + '/procesales.asp?nidCausa=' + nid, {
-    timeout: 60000,
-    validateStatus: () => true,
-    headers: { 'Cookie': cookie, 'User-Agent': 'Mozilla/5.0', 'Referer': BASE + '/causas.asp' }
-  });
-  const $ = cheerio.load(r.data);
-  const acts = [];
-  $('table tr').each((_, row) => {
-    const cells = $(row).find('td');
-    const f = cells.eq(0).text().trim();
-    const d = cells.eq(1).text().trim();
-    if (/\d{2}\/\d{2}\/\d{4}/.test(f) && d) acts.push({ fecha: f, descripcion: d });
-  });
-  return acts;
-}
-
-function parseDate(s) {
-  if (!s) return null;
-  const m = s.match(/(\d{2})\/(\d{2})\/(\d{4})/);
-  return m ? new Date(+m[3], +m[2]-1, +m[1]) : null;
-}
-
-function inRange(dateStr, desde, hasta) {
-  const d = parseDate(dateStr);
-  if (!d) return false;
-  const a = parseDate(desde);
-  const b = parseDate(hasta);
-  if (b) b.setHours(23,59,59);
-  return (!a || d >= a) && (!b || d <= b);
-}
-
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-async function scanMEV(opts) {
-  console.log('[MEV] Iniciando scan...');
-  const cookie = await mevLogin(opts.usuario, opts.clave);
-
+  $('input[type=checkbox]').each((_, cb) => {
+    const nidCausa = $(cb).attr('value');
+    if (!nidCausa || nidCausa.trim() === '') return;
+    const juzgadoInput = $(cb).next('input[type=hidden]');
+    const juzgado = juzgadoInput.attr('value')?.trim() || '';
+    const caratulaLink = juzgadoInput.next('a');
+    const caratula = caratulaLink.text().trim();
+    const despachoLink = $(cb).parent().find('a[href*="procesales"]').last();
+    const despacho = despachoLink.find('font, span, *').text().trim() || despachoLink.text().trim();
+    causas.push({ nidCausa: nidCausa.trim(), pidJuzgado: §W¦vFòÂ6&GVÆÂ6WDæöÖ'&RÂVÇFÖôFW76ó¢FW76òÒ°¢Ò°¢&WGW&â6W63°§Ð ¦Íå¹Õ¹Ñ¥½¸ÑÑÕ¥½¹Ì¡±¥¹Ð°¹¥
+ÕÍ°Á¥)Õé¼°Í°¡ÍÑ¤ì(½¹ÍÐÕÉ°ôí	Mô½ÁÉ½Í±Ì¹ÍÀý¹¥
+ÕÍôí¹¥
+ÕÍôÁ¥)Õé¼ôí¹½UI%
+½µÁ½¹¹Ð¡Á¥)Õé¼¥õì(½¹ÍÐÈôÝ¥Ð±¥¹Ð¹Ð¡ÕÉ°°ì¡ÉÌèìIÉÈè	M¬½ÉÍÕ±Ñ½Ì¹ÍÀôô¤ì(½¹ÍÐô¡É¥¼¹±½¡È¹Ññð¤ì(½¹ÍÐÑÌômtì( Ñ±ÑÈ¤¹  ¡|°É½Ü¤ôøì(½¹ÍÐ±±Ìô¡É½Ü¤¹¥¹ Ñ¤ì(½¹ÍÐ¡ô±±Ì¹Ä À¤¹ÑáÐ ¤¹ÑÉ¥´ ¤ì(½¹ÍÐÍô±±Ì¹Ä Ä¤¹ÑáÐ ¤¹ÑÉ¥´ ¤ì(¥ ½qìÉõp½qìÉõp½qìÑô¼¹ÑÍÐ¡¡¤ÍÍ¹¥¹±ÕÌ ¡¤¤ì(ÑÌ¹ÁÕÍ ¡ì¡°ÍÉ¥Á¥½¸èÍô¤ì(ô(ô¤ì(½¹ÍÐÍÐôÁÉÍÑ¡Í¤ì(½¹ÍÐ¡ÍÑÐôÁÉÍÑ¡¡ÍÑ¤ì(¥¡¡ÍÑÐ¤¡ÍÑÐ¹ÍÑ!½ÕÉÌ àØÌäääää¤ì(ÉÑÕÉ¸ÑÌ¹¥±ÑÈ¡ôøì(½¹ÍÐôÁÉÍÑ¡¹¡¤ì(¥ ¤ÉÑÕÉ¸±Íì(ÉÑÕÉ¸ ÍÐñðøôÍÐ¤ ¡ÍÑÐñððô¡ÍÑÐ¤ì(ô¤ì)ô()Õ¹Ñ¥½¸ÁÉÍÑ¡Ì¤ì(¥ Ì¤ÉÑÕÉ¸¹Õ±°ì(½¹ÍÐ´ôÌ¹µÑ  ¼¡qìÉô¥p¼¡qìÉô¥p¼¡qìÑô¤¼¤ì(ÉÑÕÉ¸´ü¹ÜÑ ­µlÍt°­µlÉt´Ä°­µlÅt¤è¹Õ±°ì)ô()½¹ÍÐÍ±ÀôµÌôø¹ÜAÉ½µ¥Í¡ÈôøÍÑQ¥µ½ÕÐ¡È°µÌ¤¤ì()sync function scanMEV(opts) {
+  const client = createClient();
+  console.log('[MEV] Iniciando scan');
+  const posHtml = await mevLogin(client, opts.usuario, opts.clave);
+  let busquedaHtml = await selectDepto(client, posHtml, '6');
+  if (!busquedaHtml.includes('SetNovedades')) {
+    console.log('[MEV] GET directo busqueda');
+    const r = await client.get(BASE + '/Busqueda.asp', { headers: { 'Referer': BASE + '/POSLoguin.asp' } });
+    busquedaHtml = (r.data || '').toString();
+  }
+  if (!busquedaHtml.includes('SetNovedades')) throw new Error('No se pudo acceder a busqueda.asp');
+  const sets = parseSets(busquedaHtml);
+  console.log('[MEV] Sets: ' + sets.map(s => s.nombre).join(', '));
+  if (sets.length === 0) throw new Error('No se encontraron sets');
   let todas = [];
-  let deptosConCausas = 0;
-
-  for (const depto of DEPTOS) {
+  for (const set of sets) {
     try {
-      const html = await getCausasDepto(cookie, depto.id, depto.nombre);
-      const causas = parseCausas(html, depto.nombre);
-      if (causas.length > 0) {
-        deptosConCausas++;
-        console.log('[MEV] ' + depto.nombre + ': ' + causas.length + ' causas');
-        todas = todas.concat(causas);
-      }
-      await sleep(300);
-    } catch(e) {
-      console.error('[MEV] Error depto ' + depto.nombre + ': ' + e.message);
-    }
+      console.log('[MEV] Set: ' + set.nombre);
+      const html = await getResultados(client, set.id, opts.fechaDesde, opts.fechaHasta);
+      if (html.includes('No arroja resultados')) { console.log('[MEV] ' + set.nombre + ': sin resultados'); continue; }
+      const causas = parseResultados(html, set.nombre);
+      console.log('[MEV] ' + set.nombre + ': ' + causas.length + ' causas');
+      todas = todas.concat(causas);
+      await sleep(400);
+    } catch(e) { console.error('[MEV] Error set: ' + e.message); }
   }
-
-  console.log('[MEV] Total causas: ' + todas.length + ' en ' + deptosConCausas + ' deptos');
-
-  const conNov = todas.filter(c => inRange(c.ultimaNovedad, opts.fechaDesde, opts.fechaHasta));
-  console.log('[MEV] Con novedades en el periodo: ' + conNov.length);
-
-  const detalladas = [];
-  for (const causa of conNov) {
+  console.log('[MEV] Total: ' + todas.length);
+  if (todas.length === 0) return { total: 0, conNovedades: 0, emailEnviado: false };
+  const det = [];
+  for (const c of todas) {
     try {
-      const acts = await getActuaciones(cookie, causa.nidCausa);
-      const enRango = acts.filter(a => inRange(a.fecha, opts.fechaDesde, opts.fechaHasta));
-      if (enRango.length > 0) detalladas.push({ ...causa, actuaciones: enRango });
+      const acts = await getActuaciones(client, c.nidCausa, c.pidJuzgado, opts.fechaDesde, opts.fechaHasta);
+      det.push({ ...c, actuaciones: acts.length > 0 ? acts : [{ fecha: '', descripcion: c.ultimoDespacho }] });
       await sleep(200);
-    } catch(e) {
-      console.error('[MEV] Error causa ' + causa.nidCausa + ': ' + e.message);
-    }
+    } catch(e) { det.push({ ...c, actuaciones: [{ fecha: '', descripcion: c.ultimoDespacho }] }); }
   }
-
-  console.log('[MEV] Con actuaciones detalladas: ' + detalladas.length);
-
-  if (detalladas.length > 0) {
-    await sendEmail(detalladas, opts.emailDestino, opts.fechaDesde, opts.fechaHasta, opts.smtpConfig);
-    console.log('[MEV] Email enviado a ' + opts.emailDestino);
-  }
-
-  return { total: todas.length, conNovedades: detalladas.length, emailEnviado: detalladas.length > 0 };
+  await sendEmail(det, opts.emailDestino, opts.fechaDesde, opts.fechaHasta, opts.smtpConfig);
+  return { total: todas.length, conNovedades: det.length, emailEnviado: true };
 }
 
 async function sendEmail(causas, to, desde, hasta, cfg) {
-  const t = nodemailer.createTransport({
-    host: cfg.host, port: cfg.port || 587,
-    secure: cfg.secure || false,
-    auth: { user: cfg.user, pass: cfg.pass }
-  });
-  await t.sendMail({
-    from: '"MEV Monitor" <' + cfg.user + '>',
-    to,
-    subject: 'Novedades MEV â ' + desde + ' al ' + hasta,
-    html: buildHtml(causas, desde, hasta)
-  });
+  const t = nodemailer.createTransport({ host: cfg.host, port: cfg.port || 587, secure: cfg.secure || false, auth: { user: cfg.user, pass: cfg.pass } });
+  await t.sendMail({ from: '"MEV Monitor" <' + cfg.user + '>', to, subject: 'Novedades MEV \u2014 ' + desde + ' al ' + hasta, html: buildHtml(causas, desde, hasta) });
 }
 
 function buildHtml(causas, desde, hasta) {
   const rows = causas.map(c => {
-    const filas = (c.actuaciones||[]).map(a =>
-      '<tr><td style="padding:5px 8px;border:1px solid #ddd;color:#1565c0;white-space:nowrap">' + a.fecha + '</td>' +
-      '<td style="padding:5px 8px;border:1px solid #ddd">' + a.descripcion + '</td></tr>'
-    ).join('');
-    return '<div style="margin:16px 0;padding:14px;border:1px solid #e0e0e0;border-radius:8px">' +
-      '<h3 style="margin:0 0 4px;color:#1a237e;font-size:14px">' + (c.caratula||'Sin carÃ¡tula') + '</h3>' +
-      '<p style="margin:0 0 8px;color:#888;font-size:12px">' + (c.juzgado||'') + ' â ase ' + (c.depto||'') + ' | Causa: ' + c.nidCausa + '</p>' +
-      '<table style="width:100%;border-collapse:collapse;font-size:13px">' +
-      '<tr style="background:#f5f5f5"><th style="padding:5px 8px;border:1px solid #ddd;text-align:left">Fecha</th>' +
-      '<th style="padding:5px 8px;border:1px solid #ddd;text-align:left">ActuaciÃ³n</th></tr>' +
-      filas + '</table></div>';
+    const f = (c.actuaciones || []).map(a => `<tr><td style="padding:5px 8px;border:1px solid #ddd;color:#1565c0;white-space:nowrap">${a.fecha || '\u2014'}</td><td style="padding:5px 8px;border:1px solid #ddd">${a.descripcion}</td></tr>`).join('');
+    return `<div style="margin:16px 0;padding:14px;border:1px solid #e0e0e0;border-radius:8px;background:#fff"><div style="font-size:11px;color:#888;margin-bottom:4px">${c.setNombre}</div><h3 style="margin:0 0 4px;color:#1a237e;font-size:14px">${c.caratula || 'Sin car\u00e1tula'}</h3><p style="margin:0 0 8px;color:#888;font-size:12px">Causa: ${c.nidCausa}</p><table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f5f5f5"><th style="padding:5px 8px;border:1px solid #ddd;text-align:left;width:120px">Fecha</th><th style="padding:5px 8px;border:1px solid #ddd;text-align:left">Actuaci\u00f3n</th></tr>${f}</table></div>`;
   }).join('');
-  return '<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;padding:20px">' +
-    '<div style="background:#1a237e;color:white;padding:18px;border-radius:8px 8px 0 0">' +
-    '<h2 style="margin:0">Novedades MEV</h2>' +
-    '<p style="margin:4px 0 0;opacity:.8;font-size:13px">Periodo: ' + desde + ' â ' + hasta + '</p></div>' +
-    '<div style="background:#e8eaf6;padding:10px 18px;margin-bottom:16px;border-radius:0 0 8px 8px">' +
-    '<strong>' + causas.length + '</strong> causa' + (causas.length!==1?'s':'') + ' con novedades</div>' +
-    rows + '</body></html>';
+  return `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;padding:20px;background:#f5f5f5"><div style="background:#1a237e;color:white;padding:20px;border-radius:8px 8px 0 0"><h2 style="margin:0">\ud83d\udccb Novedades MEV</h2><p style="margin:6px 0 0;opacity:.85;font-size:13px">Periodo: ${desde} \u2014 ${hasta}</p></div><div style="background:#e8eaf6;padding:12px 20px;margin-bottom:8px;border-radius:0 0 8px 8px"><strong>${causas.length}</strong> causa${causas.length !== 1 ? 's' : ''} con novedades</div>${rows}<p style="color:#aaa;font-size:11px;text-align:center;margin-top:24px">MEV Monitor</p></body></html>`;
 }
 
 const jobs = {};
-function formatDate(d) {
-  return String(d.getDate()).padStart(2,'0') + '/' + String(d.getMonth()+1).padStart(2,'0') + '/' + d.getFullYear();
-}
+function formatDate(d) { return String(d.getDate()).padStart(2,'0') + '/' + String(d.getMonth()+1).padStart(2,'0') + '/' + d.getFullYear(); }
 
 app.post('/api/scan', async (req, res) => {
   const { usuario, password, fechaDesde, fechaHasta, emailDestino } = req.body;
-  if (!usuario || !password || !emailDestino)
-    return res.status(400).json({ error: 'Faltan campos requeridos' });
-
+  if (!usuario || !password || !emailDestino) return res.status(400).json({ error: 'Faltan campos' });
   const hoy = new Date();
-  const desde = fechaDesde || formatDate(new Date(hoy - 7*86400000));
+  const desde = fechaDesde || formatDate(new Date(hoy - 7 * 86400000));
   const hasta = fechaHasta || formatDate(hoy);
-
-  const cfg = {
-    host: process.env.SMTP_HOST || 'smtp.gmail.com',
-    port: parseInt(process.env.SMTP_PORT || '587'),
-    secure: process.env.SMTP_SECURE === 'true',
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
-  };
-
-  if (!cfg.user || !cfg.pass)
-    return res.status(500).json({ error: 'SMTP no configurado en el servidor' });
-
+  const cfg = { host: process.env.SMTP_HOST || 'smtp.gmail.com', port: parseInt(process.env.SMTP_PORT || '587'), secure: process.env.SMTP_SECURE === 'true', user: process.env.SMTP_USER, pass: process.env.SMTP_PASS };
+  if (!cfg.user || !cfg.pass) return res.status(500).json({ error: 'SMTP no configurado' });
   const jobId = Date.now().toString();
-  jobs[jobId] = { status: 'running' };
-
+  jobs[jobId] = { status: 'running', startedAt: new Date().toISOString() };
   scanMEV({ usuario, clave: password, fechaDesde: desde, fechaHasta: hasta, emailDestino, smtpConfig: cfg })
     .then(result => { jobs[jobId] = { status: 'done', result }; })
     .catch(err => { jobs[jobId] = { status: 'error', error: err.message }; });
-
-  res.json({ jobId, message: 'Scan iniciado' });
+  res.json({ jobId, message: 'Scan iniciado', fechaDesde: desde, fechaHasta: hasta });
 });
 
 app.get('/api/status/:id', (req, res) => {
