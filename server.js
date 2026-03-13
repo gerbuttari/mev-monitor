@@ -86,6 +86,7 @@ async function mevLogin(usuario, clave) {
     throw new Error('Credenciales incorrectas. VerificÃ¡ usuario y clave en la MEV.');
   }
 
+  // If we're NOT on POSLoguin.asp, something went wrong
   if (!finalUrl.includes('POSLoguin') && !body.includes('POSLoguin') && !body.includes('Organismo')) {
     if (finalUrl && !finalUrl.includes('loguin')) {
       console.log('[MEV] Unexpected redirect to: ' + finalUrl);
@@ -106,6 +107,7 @@ async function getCausasDepto(cookie, deptoId, deptoNombre) {
     'Referer': BASE + '/POSLoguin.asp'
   };
 
+  // POST to POSLoguin.asp to select departamento
   const params = new URLSearchParams();
   params.append('TipoDto', 'CC');
   params.append('DtoJudElegido', deptoId);
@@ -255,7 +257,7 @@ function buildHtml(causas, desde, hasta) {
     ).join('');
     return '<div style="margin:16px 0;padding:14px;border:1px solid #e0e0e0;border-radius:8px">' +
       '<h3 style="margin:0 0 4px;color:#1a237e;font-size:14px">' + (c.caratula||'Sin carÃ¡tula') + '</h3>' +
-      '<p style="margin:0 0 8px;color:#888;font-size:12px">' + (c.juzgado||'') + ' â ' + (c.depto||'') + ' | Causa: ' + c.nidCausa + '</p>' +
+      '<p style="margin:0 0 8px;color:#888;font-size:12px">' + (c.juzgado||'') + ' â ase ' + (c.depto||'') + ' | Causa: ' + c.nidCausa + '</p>' +
       '<table style="width:100%;border-collapse:collapse;font-size:13px">' +
       '<tr style="background:#f5f5f5"><th style="padding:5px 8px;border:1px solid #ddd;text-align:left">Fecha</th>' +
       '<th style="padding:5px 8px;border:1px solid #ddd;text-align:left">ActuaciÃ³n</th></tr>' +
