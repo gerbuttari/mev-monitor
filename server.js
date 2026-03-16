@@ -18,7 +18,7 @@ function createClient() {
   const client = wrapper(axios.create({
     jar,
     withCredentials: true,
-    timeout: 60000,
+    timeout: 15000,
     maxRedirects: 10,
     validateStatus: () => true,
     headers: {
@@ -54,10 +54,10 @@ async function mevLogin(client, usuario, clave) {
     lower.includes('usuario o clave') ||
     lower.includes('datos incorrectos')
   ) {
-    throw new Error('Credenciales incorrectas. Verific\u00e1 usuario y clave en la MEV.');
+    throw new Error('Credenciales incorrectas.');
   }
   if (!finalUrl.includes('POSLoguin') && !body.includes('POSLoguin') && !body.includes('Seleccione el Organismo')) {
-    if (r2.status >= 400) throw new Error('Error al iniciar sesi\u00f3n (HTTP ' + r2.status + ')');
+    if (r2.status >= 400) throw new Error('Error al iniciar sesion (HTTP ' + r2.status + ')');
   }
   console.log('[MEV] Login OK');
   return body;
@@ -120,7 +120,7 @@ function parseResultados(html, setNombre) {
 
 async function getActuaciones(client, nidCausa, pidJuzgado, desde, hasta) {
   const url = BASE + '/procesales.asp?nidCausa=' + nidCausa + '&pidJuzgado=' + encodeURIComponent(pidJuzgado);
-  const r = await client.get(url, { headers: { 'Referer': BASE + '/resultados.asp' } });
+  const r = await client.get(url, { timeout: 10000, headers: { 'Referer': BASE + '/resultados.asp' } });
   const $ = cheerio.load(r.data || '');
   const acts = [];
   $('table tr').each((_, row) => {
@@ -175,7 +175,7 @@ async function scanMEV(opts) {
       const causas = parseResultados(html, set.nombre);
       console.log('[MEV] ' + set.nombre + ': ' + causas.length + ' causas');
       todas = todas.concat(causas);
-      await sleep(400);
+      await sleep(300);
     } catch(e) {
       console.error('[MEV] Error set ' + set.nombre + ': ' + e.message);
     }
@@ -186,13 +186,17 @@ async function scanMEV(opts) {
   for (const c of todas) {
     try {
       const acts = await getActuaciones(client, c.nidCausa, c.pidJuzgado, opts.fechaDesde, opts.fechaHasta);
+      console.log('[MEV] procesales ' + c.nidCausa + ': ' + acts.length + ' acts');
       det.push(Object.assign({}, c, { actuaciones: acts.length > 0 ? acts : [{ fecha: '', descripcion: c.ultimoDespacho }] }));
       await sleep(200);
     } catch(e) {
+      console.log('[MEV] procesales ' + c.nidCausa + ' error (usando despacho): ' + e.message);
       det.push(Object.assign({}, c, { actuaciones: [{ fecha: '', descripcion: c.ultimoDespacho }] }));
     }
   }
+  console.log('[MEV] Enviando email a ' + opts.emailDestino);
   await sendEmail(det, opts.emailDestino, opts.fechaDesde, opts.fechaHasta, opts.smtpConfig);
+  console.log('[MEV] Email enviado OK');
   return { total: todas.length, conNovedades: det.length, emailEnviado: true };
 }
 
@@ -201,12 +205,14 @@ async function sendEmail(causas, to, desde, hasta, cfg) {
     host: cfg.host,
     port: cfg.port || 587,
     secure: cfg.secure || false,
+    connectionTimeout: 15000,
+    socketTimeout: 15000,
     auth: { user: cfg.user, pass: cfg.pass }
   });
   await t.sendMail({
     from: '"MEV Monitor" <' + cfg.user + '>',
     to: to,
-    subject: 'Novedades MEV \u2014 ' + desde + ' al ' + hasta,
+    subject: 'Novedades MEV — ' + desde + ' al ' + hasta,
     html: buildHtml(causas, desde, hasta)
   });
 }
@@ -214,21 +220,21 @@ async function sendEmail(causas, to, desde, hasta, cfg) {
 function buildHtml(causas, desde, hasta) {
   const rows = causas.map(function(c) {
     const f = (c.actuaciones || []).map(function(a) {
-      return '<tr><td style="padding:5px 8px;border:1px solid #ddd;color:#1565c0;white-space:nowrap">' + (a.fecha || '\u2014') + '</td><td style="padding:5px 8px;border:1px solid #ddd">' + a.descripcion + '</td></tr>';
+      return '<tr><td style="padding:5px 8px;border:1px solid #ddd;color:#1565c0;white-space:nowrap">' + (a.fecha || '—') + '</td><td style="padding:5px 8px;border:1px solid #ddd">' + a.descripcion + '</td></tr>';
     }).join('');
     return '<div style="margin:16px 0;padding:14px;border:1px solid #e0e0e0;border-radius:8px;background:#fff">' +
       '<div style="font-size:11px;color:#888;margin-bottom:4px">' + c.setNombre + '</div>' +
-      '<h3 style="margin:0 0 4px;color:#1a237e;font-size:14px">' + (c.caratula || 'Sin car\u00e1tula') + '</h3>' +
+      '<h3 style="margin:0 0 4px;color:#1a237e;font-size:14px">' + (c.caratula || 'Sin caratula') + '</h3>' +
       '<p style="margin:0 0 8px;color:#888;font-size:12px">Causa: ' + c.nidCausa + '</p>' +
       '<table style="width:100%;border-collapse:collapse;font-size:13px">' +
       '<tr style="background:#f5f5f5"><th style="padding:5px 8px;border:1px solid #ddd;text-align:left;width:120px">Fecha</th>' +
-      '<th style="padding:5px 8px;border:1px solid #ddd;text-align:left">Actuaci\u00f3n</th></tr>' +
+      '<th style="padding:5px 8px;border:1px solid #ddd;text-align:left">Actuacion</th></tr>' +
       f + '</table></div>';
   }).join('');
   return '<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;padding:20px;background:#f5f5f5">' +
     '<div style="background:#1a237e;color:white;padding:20px;border-radius:8px 8px 0 0">' +
-    '<h2 style="margin:0">\ud83d\udccb Novedades MEV</h2>' +
-    '<p style="margin:6px 0 0;opacity:.85;font-size:13px">Per\u00edodo: ' + desde + ' \u2014 ' + hasta + '</p></div>' +
+    '<h2 style="margin:0">Novedades MEV</h2>' +
+    '<p style="margin:6px 0 0;opacity:.85;font-size:13px">Periodo: ' + desde + ' - ' + hasta + '</p></div>' +
     '<div style="background:#e8eaf6;padding:12px 20px;margin-bottom:8px;border-radius:0 0 8px 8px">' +
     '<strong>' + causas.length + '</strong> causa' + (causas.length !== 1 ? 's' : '') + ' con novedades</div>' +
     rows +
@@ -262,8 +268,14 @@ app.post('/api/scan', async function(req, res) {
   const jobId = Date.now().toString();
   jobs[jobId] = { status: 'running', startedAt: new Date().toISOString() };
   scanMEV({ usuario: usuario, clave: password, fechaDesde: desde, fechaHasta: hasta, emailDestino: emailDestino, smtpConfig: cfg })
-    .then(function(result) { jobs[jobId] = { status: 'done', result: result }; })
-    .catch(function(err) { jobs[jobId] = { status: 'error', error: err.message }; });
+    .then(function(result) {
+      console.log('[MEV] Job done: ' + JSON.stringify(result));
+      jobs[jobId] = { status: 'done', result: result };
+    })
+    .catch(function(err) {
+      console.error('[MEV] Job error: ' + err.message);
+      jobs[jobId] = { status: 'error', error: err.message };
+    });
   res.json({ jobId: jobId, message: 'Scan iniciado', fechaDesde: desde, fechaHasta: hasta });
 });
 
