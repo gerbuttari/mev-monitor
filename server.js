@@ -150,7 +150,7 @@ async function sendEmail(causas, to, desde, hasta) {
   });
 
   if (resp.status >= 400) throw new Error('Resend error: ' + JSON.stringify(resp.data));
-  console.log('[MEV] Resend OK, id: ' + resp.data.id);
+  console.log('[MEV] Resend OK id: ' + resp.data.id);
 }
 
 const jobs = {};
