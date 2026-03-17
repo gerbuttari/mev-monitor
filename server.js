@@ -15,7 +15,7 @@ const BASE = 'https://mev.scba.gov.ar';
 function createClient() {
   const jar = new CookieJar();
   return wrapper(axios.create({
-    jar, withCredentials: true, timeout: 20000, maxRedirects: 10,
+    jar, withCredentials: true, timeout: 10000, maxRedirects: 10,
     validateStatus: () => true,
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
@@ -55,17 +55,6 @@ async function selectDepto(client, deptoId) {
   return (r.data || '').toString();
 }
 
-async function changeOrganismo(client, gamCode) {
-  const p = new URLSearchParams();
-  p.append('TipoDto', 'GG');
-  p.append('DtoJudElegido', gamCode);
-  p.append('Aceptar', 'Aceptar');
-  const r = await client.post(BASE + '/POSLoguin.asp', p.toString(), {
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': BASE + '/busqueda.asp' }
-  });
-  return (r.data || '').toString();
-}
-
 function parseSets(html) {
   const $ = cheerio.load(html);
   const sets = [];
@@ -75,29 +64,15 @@ function parseSets(html) {
   });
   return sets;
 }
-async function getOrganismosDelSet(client, nidset) {
-  const url = BASE + '/resultados.asp?nidset=' + nidset + '&sFechaDesde=&sFechaHasta=&pOrden=xCa&pOrdenAD=Asc';
-  const r = await client.get(url, { headers: { 'Referer': BASE + '/busqueda.asp' } });
-  const html = (r.data || '').toString();
-  const $ = cheerio.load(html);
-  const organismos = [];
-  $('select[name=JuzgadoElegido] option').each((_, el) => {
-    const val = $(el).attr('value');
-    if (val && val.trim()) organismos.push({ codigo: val.trim(), nombre: $(el).text().trim() });
-  });
-  return organismos;
-}
 
-async function getOrganismosBusqueda(client) {
-  const r = await client.get(BASE + '/busqueda.asp', { headers: { 'Referer': BASE + '/POSLoguin.asp' } });
-  const html = (r.data || '').toString();
+function getOrganismosFromBusqueda(html) {
   const $ = cheerio.load(html);
-  const organismos = [];
+  const orgs = [];
   $('select[name=JuzgadoElegido] option').each((_, el) => {
     const val = $(el).attr('value');
-    if (val && val.trim()) organismos.push({ codigo: val.trim(), nombre: $(el).text().trim() });
+    if (val && val.trim()) orgs.push({ codigo: val.trim(), nombre: $(el).text().trim() });
   });
-  return organismos;
+  return orgs;
 }
 
 function parseResultados(html, setNombre) {
@@ -111,8 +86,8 @@ function parseResultados(html, setNombre) {
     const caratula = hidden.next('a').text().trim();
     const despachoLink = $(cb).parent().find('a[href*="procesales"]').last();
     const despacho = despachoLink.text().trim();
-    const despachoHref = despachoLink.attr('href') || '';
-    const linkDespacho = despachoHref ? (despachoHref.startsWith('http') ? despachoHref : BASE + '/' + despachoHref.replace(/^\//, '')) : '';
+    const href = despachoLink.attr('href') || '';
+    const linkDespacho = href ? (href.startsWith('http') ? href : BASE + '/' + href.replace(/^\//, '')) : '';
     causas.push({ nidCausa: nidCausa.trim(), pidJuzgado, caratula, setNombre, despacho, linkDespacho });
   });
   return causas;
@@ -126,7 +101,7 @@ function parseDate(s) {
 
 async function getActuaciones(client, nidCausa, pidJuzgado, desde, hasta) {
   const url = BASE + '/procesales.asp?nidCausa=' + nidCausa + '&pidJuzgado=' + encodeURIComponent(pidJuzgado);
-  const r = await client.get(url, { timeout: 12000, headers: { 'Referer': BASE + '/resultados.asp' } });
+  const r = await client.get(url, { timeout: 10000, headers: { 'Referer': BASE + '/resultados.asp' } });
   const $ = cheerio.load(r.data || '');
   const desdeDt = parseDate(desde);
   const hastaDt = parseDate(hasta);
@@ -138,9 +113,7 @@ async function getActuaciones(client, nidCausa, pidJuzgado, desde, hasta) {
     const fecha = cells.eq(0).text().trim();
     if (!/\d{2}\/\d{2}\/\d{4}/.test(fecha)) return;
     const d = parseDate(fecha);
-    if (!d) return;
-    if (desdeDt && d < desdeDt) return;
-    if (hastaDt && d > hastaDt) return;
+    if (!d || (desdeDt && d < desdeDt) || (hastaDt && d > hastaDt)) return;
     const desc = cells.eq(1).text().trim();
     if (!desc || desc.includes('Fecha') || desc.includes('Actuacion')) return;
     const linkEl = cells.eq(1).find('a').first();
@@ -162,63 +135,71 @@ async function scanMEV(opts) {
     busHtml = (r.data || '').toString();
   }
   if (!busHtml.includes('SetNovedades')) throw new Error('No se pudo acceder a busqueda.asp');
+
   const sets = parseSets(busHtml);
   console.log('[MEV] Sets: ' + sets.map(s => s.nombre).join(', '));
   if (!sets.length) throw new Error('No se encontraron sets');
 
-  const todosOrganismos = await getOrganismosBusqueda(client);
-  console.log('[MEV] Organismos: ' + todosOrganismos.length);
+  const organismos = getOrganismosFromBusqueda(busHtml);
+  console.log('[MEV] Organismos disponibles: ' + organismos.length);
 
   const todasCausas = [];
-  const vistosNidCausa = new Set();
+  const vistos = new Set();
 
   for (const set of sets) {
-    console.log('[MEV] Set: ' + set.nombre);
-    let organismosDeLSet = await getOrganismosDelSet(client, set.id);
-    if (organismosDeLSet.length === 0) organismosDeLSet = todosOrganismos;
-    console.log('[MEV] ' + set.nombre + ': ' + organismosDeLSet.length + ' organismos');
+    console.log('[MEV] Set: ' + set.nombre + ' (' + organismos.length + ' organismos)');
+    let encontradas = 0;
 
-    for (const org of organismosDeLSet) {
+    for (const org of organismos) {
       try {
-        await changeOrganismo(client, org.codigo);
-        await sleep(200);
-        const url = BASE + '/resultados.asp?nidset=' + set.id +
-          '&sFechaDesde=' + encodeURIComponent(opts.fechaDesde) +
-          '&sFechaHasta=' + encodeURIComponent(opts.fechaHasta) +
-          '&pOrden=xCa&pOrdenAD=Asc';
-        const r = await client.get(url, { headers: { 'Referer': BASE + '/busqueda.asp' } });
+        // POST to Busqueda.asp: this changes session organismo AND returns resultados
+        const p = new URLSearchParams();
+        p.append('OpcionBusqueda', 'xNs');
+        p.append('JuzgadoElegido', org.codigo);
+        p.append('SetNovedades', set.id);
+        p.append('Desde', opts.fechaDesde);
+        p.append('Hasta', opts.fechaHasta);
+        p.append('radio', 'xNs');
+        p.append('Buscar', 'Buscar');
+
+        const r = await client.post(BASE + '/Busqueda.asp', p.toString(), {
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': BASE + '/busqueda.asp' },
+          timeout: 8000
+        });
         const html = (r.data || '').toString();
-        if (html.includes('No arroja resultados')) { await sleep(100); continue; }
+        if (html.includes('No arroja resultados')) { await sleep(50); continue; }
+
         const causas = parseResultados(html, set.nombre);
         if (causas.length > 0) {
           console.log('[MEV] ' + org.nombre.trim() + ': ' + causas.length + ' causas');
+          encontradas += causas.length;
           for (const c of causas) {
-            if (!vistosNidCausa.has(c.nidCausa)) {
-              vistosNidCausa.add(c.nidCausa);
+            if (!vistos.has(c.nidCausa)) {
+              vistos.add(c.nidCausa);
               todasCausas.push(c);
             }
           }
         }
-        await sleep(300);
+        await sleep(150);
       } catch(e) {
-        console.error('[MEV] Error org ' + org.codigo + ': ' + e.message);
+        // timeout or error - skip this organismo
+        await sleep(50);
       }
     }
+    console.log('[MEV] ' + set.nombre + ': ' + encontradas + ' causas total');
   }
 
   console.log('[MEV] Total causas unicas: ' + todasCausas.length);
   if (!todasCausas.length) return { total: 0, emailEnviado: false };
 
+  // Get actuaciones for each causa
   const resultado = [];
   for (const c of todasCausas) {
     try {
-      await changeOrganismo(client, c.pidJuzgado);
       const acts = await getActuaciones(client, c.nidCausa, c.pidJuzgado, opts.fechaDesde, opts.fechaHasta);
-      console.log('[MEV] procesales ' + c.nidCausa + ': ' + acts.length + ' acts');
       resultado.push({ ...c, actuaciones: acts.length > 0 ? acts : [{ fecha: '', descripcion: c.despacho, link: c.linkDespacho }] });
-      await sleep(200);
+      await sleep(150);
     } catch(e) {
-      console.log('[MEV] procesales fallback ' + c.nidCausa);
       resultado.push({ ...c, actuaciones: [{ fecha: '', descripcion: c.despacho, link: c.linkDespacho }] });
     }
   }
@@ -234,33 +215,12 @@ async function sendEmail(causas, to, desde, hasta) {
   const causaBlocks = causas.map(c => {
     const actRows = (c.actuaciones || []).map(a => {
       const linkHtml = a.link ? '<a href="' + a.link + '" style="color:#1565c0;font-weight:600;text-decoration:none" target="_blank">Ver</a>' : '';
-      return '<tr>' +
-        '<td style="padding:7px 10px;border-bottom:1px solid #f0f0f0;font-size:12px;color:#1565c0;white-space:nowrap;vertical-align:top">' + (a.fecha || '--') + '</td>' +
-        '<td style="padding:7px 10px;border-bottom:1px solid #f0f0f0;font-size:13px;vertical-align:top">' + a.descripcion + '</td>' +
-        '<td style="padding:7px 10px;border-bottom:1px solid #f0f0f0;font-size:12px;vertical-align:top;text-align:center;width:50px">' + linkHtml + '</td>' +
-        '</tr>';
+      return '<tr><td style="padding:7px 10px;border-bottom:1px solid #f0f0f0;font-size:12px;color:#1565c0;white-space:nowrap;vertical-align:top">' + (a.fecha || '--') + '</td><td style="padding:7px 10px;border-bottom:1px solid #f0f0f0;font-size:13px;vertical-align:top">' + a.descripcion + '</td><td style="padding:7px 10px;border-bottom:1px solid #f0f0f0;text-align:center;vertical-align:top;width:50px">' + linkHtml + '</td></tr>';
     }).join('');
     const noActs = (!c.actuaciones || !c.actuaciones.length) ? '<tr><td colspan="3" style="padding:8px 10px;font-size:12px;color:#999;font-style:italic">Sin actuaciones en el periodo</td></tr>' : '';
-    return '<div style="margin-bottom:16px;border:1px solid #ddd;border-radius:8px;overflow:hidden">' +
-      '<div style="background:#1a237e;padding:10px 14px">' +
-      '<div style="color:white;font-size:13px;font-weight:700">' + (c.caratula || 'Sin caratula') + '</div>' +
-      '<div style="color:rgba(255,255,255,.7);font-size:11px;margin-top:2px">' + c.setNombre + ' - Causa ' + c.nidCausa + '</div>' +
-      '</div>' +
-      '<table style="width:100%;border-collapse:collapse;background:white">' +
-      '<tr style="background:#f5f5f5">' +
-      '<th style="padding:6px 10px;font-size:11px;color:#555;text-align:left;width:90px">FECHA</th>' +
-      '<th style="padding:6px 10px;font-size:11px;color:#555;text-align:left">NOVEDAD</th>' +
-      '<th style="padding:6px 10px;font-size:11px;color:#555;text-align:center;width:50px">DOC</th>' +
-      '</tr>' + actRows + noActs + '</table></div>';
+    return '<div style="margin-bottom:16px;border:1px solid #ddd;border-radius:8px;overflow:hidden"><div style="background:#1a237e;padding:10px 14px"><div style="color:white;font-size:13px;font-weight:700">' + (c.caratula || 'Sin caratula') + '</div><div style="color:rgba(255,255,255,.7);font-size:11px;margin-top:2px">' + c.setNombre + ' - Causa ' + c.nidCausa + '</div></div><table style="width:100%;border-collapse:collapse;background:white"><tr style="background:#f5f5f5"><th style="padding:6px 10px;font-size:11px;color:#555;text-align:left;width:90px">FECHA</th><th style="padding:6px 10px;font-size:11px;color:#555;text-align:left">NOVEDAD</th><th style="padding:6px 10px;font-size:11px;color:#555;text-align:center;width:50px">DOC</th></tr>' + actRows + noActs + '</table></div>';
   }).join('');
-  const html = '<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:750px;margin:0 auto;background:#f0f2f5;padding:20px">' +
-    '<div style="background:#1a237e;padding:20px 24px;border-radius:8px 8px 0 0">' +
-    '<h2 style="margin:0;color:white;font-size:20px">Novedades MEV</h2>' +
-    '<p style="margin:4px 0 0;color:rgba(255,255,255,.8);font-size:13px">Periodo: ' + desde + ' al ' + hasta + '</p></div>' +
-    '<div style="background:#e8eaf6;padding:10px 24px;border-radius:0 0 8px 8px;margin-bottom:16px">' +
-    '<strong>' + causas.length + '</strong> causa' + (causas.length !== 1 ? 's' : '') + ' con novedades</div>' +
-    causaBlocks +
-    '<p style="color:#aaa;font-size:11px;text-align:center;margin-top:8px">MEV Monitor - SCBA</p></body></html>';
+  const html = '<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:750px;margin:0 auto;background:#f0f2f5;padding:20px"><div style="background:#1a237e;padding:20px 24px;border-radius:8px 8px 0 0"><h2 style="margin:0;color:white;font-size:20px">Novedades MEV</h2><p style="margin:4px 0 0;color:rgba(255,255,255,.8);font-size:13px">Periodo: ' + desde + ' al ' + hasta + '</p></div><div style="background:#e8eaf6;padding:10px 24px;border-radius:0 0 8px 8px;margin-bottom:16px"><strong>' + causas.length + '</strong> causa' + (causas.length !== 1 ? 's' : '') + ' con novedades</div>' + causaBlocks + '<p style="color:#aaa;font-size:11px;text-align:center;margin-top:8px">MEV Monitor - SCBA</p></body></html>';
   const resp = await axios.post('https://api.resend.com/emails', {
     from: 'MEV Monitor <onboarding@resend.dev>',
     to: [to],
@@ -275,7 +235,6 @@ const jobs = {};
 function fmtDate(d) {
   return String(d.getDate()).padStart(2, '0') + '/' + String(d.getMonth() + 1).padStart(2, '0') + '/' + d.getFullYear();
 }
-
 app.post('/api/scan', async (req, res) => {
   const { usuario, password, fechaDesde, fechaHasta, emailDestino } = req.body;
   if (!usuario || !password || !emailDestino) return res.status(400).json({ error: 'Faltan campos' });
@@ -290,12 +249,10 @@ app.post('/api/scan', async (req, res) => {
     .catch(err => { console.error('[MEV] error: ' + err.message); jobs[jobId] = { status: 'error', error: err.message }; });
   res.json({ jobId, fechaDesde: desde, fechaHasta: hasta });
 });
-
 app.get('/api/status/:id', (req, res) => {
   const job = jobs[req.params.id];
   if (!job) return res.status(404).json({ error: 'No encontrado' });
   res.json(job);
 });
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('MEV Monitor puerto ' + PORT));
