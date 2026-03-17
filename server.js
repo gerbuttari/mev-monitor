@@ -55,6 +55,17 @@ async function selectDepto(client, deptoId) {
   return (r.data || '').toString();
 }
 
+async function changeOrganismo(client, gamCode) {
+  const p = new URLSearchParams();
+  p.append('TipoDto', 'GG');
+  p.append('DtoJudElegido', gamCode);
+  p.append('Aceptar', 'Aceptar');
+  const r = await client.post(BASE + '/POSLoguin.asp', p.toString(), {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': BASE + '/busqueda.asp' }
+  });
+  return (r.data || '').toString();
+}
+
 function parseSets(html) {
   const $ = cheerio.load(html);
   const sets = [];
@@ -64,11 +75,29 @@ function parseSets(html) {
   });
   return sets;
 }
+async function getOrganismosDelSet(client, nidset) {
+  const url = BASE + '/resultados.asp?nidset=' + nidset + '&sFechaDesde=&sFechaHasta=&pOrden=xCa&pOrdenAD=Asc';
+  const r = await client.get(url, { headers: { 'Referer': BASE + '/busqueda.asp' } });
+  const html = (r.data || '').toString();
+  const $ = cheerio.load(html);
+  const organismos = [];
+  $('select[name=JuzgadoElegido] option').each((_, el) => {
+    const val = $(el).attr('value');
+    if (val && val.trim()) organismos.push({ codigo: val.trim(), nombre: $(el).text().trim() });
+  });
+  return organismos;
+}
 
-function parseDate(s) {
-  if (!s) return null;
-  const m = s.match(/(\d{2})\/(\d{2})\/(\d{4})/);
-  return m ? new Date(+m[3], +m[2] - 1, +m[1]) : null;
+async function getOrganismosBusqueda(client) {
+  const r = await client.get(BASE + '/busqueda.asp', { headers: { 'Referer': BASE + '/POSLoguin.asp' } });
+  const html = (r.data || '').toString();
+  const $ = cheerio.load(html);
+  const organismos = [];
+  $('select[name=JuzgadoElegido] option').each((_, el) => {
+    const val = $(el).attr('value');
+    if (val && val.trim()) organismos.push({ codigo: val.trim(), nombre: $(el).text().trim() });
+  });
+  return organismos;
 }
 
 function parseResultados(html, setNombre) {
@@ -80,9 +109,19 @@ function parseResultados(html, setNombre) {
     const hidden = $(cb).next('input[type=hidden]');
     const pidJuzgado = (hidden.attr('value') || '').trim();
     const caratula = hidden.next('a').text().trim();
-    causas.push({ nidCausa: nidCausa.trim(), pidJuzgado, caratula, setNombre });
+    const despachoLink = $(cb).parent().find('a[href*="procesales"]').last();
+    const despacho = despachoLink.text().trim();
+    const despachoHref = despachoLink.attr('href') || '';
+    const linkDespacho = despachoHref ? (despachoHref.startsWith('http') ? despachoHref : BASE + '/' + despachoHref.replace(/^\//, '')) : '';
+    causas.push({ nidCausa: nidCausa.trim(), pidJuzgado, caratula, setNombre, despacho, linkDespacho });
   });
   return causas;
+}
+
+function parseDate(s) {
+  if (!s) return null;
+  const m = s.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+  return m ? new Date(+m[3], +m[2] - 1, +m[1]) : null;
 }
 
 async function getActuaciones(client, nidCausa, pidJuzgado, desde, hasta) {
@@ -92,7 +131,6 @@ async function getActuaciones(client, nidCausa, pidJuzgado, desde, hasta) {
   const desdeDt = parseDate(desde);
   const hastaDt = parseDate(hasta);
   if (hastaDt) hastaDt.setHours(23, 59, 59);
-
   const acts = [];
   $('table tr').each((_, row) => {
     const cells = $(row).find('td');
@@ -103,23 +141,17 @@ async function getActuaciones(client, nidCausa, pidJuzgado, desde, hasta) {
     if (!d) return;
     if (desdeDt && d < desdeDt) return;
     if (hastaDt && d > hastaDt) return;
-
-    const cell1 = cells.eq(1);
-    const desc = cell1.text().trim();
+    const desc = cells.eq(1).text().trim();
     if (!desc || desc.includes('Fecha') || desc.includes('Actuacion')) return;
-
-    // Extract link if present
-    const link = cell1.find('a').first();
-    let href = '';
-    if (link.length) {
-      const rawHref = link.attr('href') || '';
-      href = rawHref.startsWith('http') ? rawHref : (rawHref ? BASE + '/' + rawHref.replace(/^\//, '') : '');
-    }
-
-    acts.push({ fecha, descripcion: desc, link: href });
+    const linkEl = cells.eq(1).find('a').first();
+    const href = linkEl.attr('href') || '';
+    const link = href ? (href.startsWith('http') ? href : BASE + '/' + href.replace(/^\//, '')) : '';
+    acts.push({ fecha, descripcion: desc, link });
   });
   return acts;
 }
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function scanMEV(opts) {
   const client = createClient();
@@ -134,39 +166,60 @@ async function scanMEV(opts) {
   console.log('[MEV] Sets: ' + sets.map(s => s.nombre).join(', '));
   if (!sets.length) throw new Error('No se encontraron sets');
 
-  let todasCausas = [];
+  const todosOrganismos = await getOrganismosBusqueda(client);
+  console.log('[MEV] Organismos: ' + todosOrganismos.length);
+
+  const todasCausas = [];
+  const vistosNidCausa = new Set();
+
   for (const set of sets) {
-    try {
-      const url = BASE + '/resultados.asp?nidset=' + set.id +
-        '&sfechadesde=' + encodeURIComponent(opts.fechaDesde) +
-        '&sfechahasta=' + encodeURIComponent(opts.fechaHasta) + '&pOrden=xCa&pOrdenAD=Asc';
-      const r = await client.get(url, { headers: { 'Referer': BASE + '/Busqueda.asp' } });
-      const html = (r.data || '').toString();
-      if (html.includes('No arroja resultados')) {
-        console.log('[MEV] ' + set.nombre + ': sin resultados');
-        continue;
+    console.log('[MEV] Set: ' + set.nombre);
+    let organismosDeLSet = await getOrganismosDelSet(client, set.id);
+    if (organismosDeLSet.length === 0) organismosDeLSet = todosOrganismos;
+    console.log('[MEV] ' + set.nombre + ': ' + organismosDeLSet.length + ' organismos');
+
+    for (const org of organismosDeLSet) {
+      try {
+        await changeOrganismo(client, org.codigo);
+        await sleep(200);
+        const url = BASE + '/resultados.asp?nidset=' + set.id +
+          '&sFechaDesde=' + encodeURIComponent(opts.fechaDesde) +
+          '&sFechaHasta=' + encodeURIComponent(opts.fechaHasta) +
+          '&pOrden=xCa&pOrdenAD=Asc';
+        const r = await client.get(url, { headers: { 'Referer': BASE + '/busqueda.asp' } });
+        const html = (r.data || '').toString();
+        if (html.includes('No arroja resultados')) { await sleep(100); continue; }
+        const causas = parseResultados(html, set.nombre);
+        if (causas.length > 0) {
+          console.log('[MEV] ' + org.nombre.trim() + ': ' + causas.length + ' causas');
+          for (const c of causas) {
+            if (!vistosNidCausa.has(c.nidCausa)) {
+              vistosNidCausa.add(c.nidCausa);
+              todasCausas.push(c);
+            }
+          }
+        }
+        await sleep(300);
+      } catch(e) {
+        console.error('[MEV] Error org ' + org.codigo + ': ' + e.message);
       }
-      const causas = parseResultados(html, set.nombre);
-      console.log('[MEV] ' + set.nombre + ': ' + causas.length + ' causas');
-      todasCausas = todasCausas.concat(causas);
-    } catch(e) {
-      console.error('[MEV] Error ' + set.nombre + ': ' + e.message);
     }
   }
 
-  console.log('[MEV] Total causas: ' + todasCausas.length);
+  console.log('[MEV] Total causas unicas: ' + todasCausas.length);
   if (!todasCausas.length) return { total: 0, emailEnviado: false };
 
-  // Fetch actuaciones for each causa
   const resultado = [];
   for (const c of todasCausas) {
     try {
+      await changeOrganismo(client, c.pidJuzgado);
       const acts = await getActuaciones(client, c.nidCausa, c.pidJuzgado, opts.fechaDesde, opts.fechaHasta);
-      console.log('[MEV] ' + c.nidCausa + ': ' + acts.length + ' actuaciones');
-      resultado.push({ ...c, actuaciones: acts });
+      console.log('[MEV] procesales ' + c.nidCausa + ': ' + acts.length + ' acts');
+      resultado.push({ ...c, actuaciones: acts.length > 0 ? acts : [{ fecha: '', descripcion: c.despacho, link: c.linkDespacho }] });
+      await sleep(200);
     } catch(e) {
-      console.log('[MEV] procesales ' + c.nidCausa + ' fallback: ' + e.message);
-      resultado.push({ ...c, actuaciones: [] });
+      console.log('[MEV] procesales fallback ' + c.nidCausa);
+      resultado.push({ ...c, actuaciones: [{ fecha: '', descripcion: c.despacho, link: c.linkDespacho }] });
     }
   }
 
@@ -178,59 +231,42 @@ async function scanMEV(opts) {
 async function sendEmail(causas, to, desde, hasta) {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) throw new Error('RESEND_API_KEY no configurado');
-
   const causaBlocks = causas.map(c => {
     const actRows = (c.actuaciones || []).map(a => {
-      const linkHtml = a.link
-        ? '<a href="' + a.link + '" style="color:#1565c0;text-decoration:none;font-weight:600" target="_blank">Ver documento</a>'
-        : '';
+      const linkHtml = a.link ? '<a href="' + a.link + '" style="color:#1565c0;font-weight:600;text-decoration:none" target="_blank">Ver</a>' : '';
       return '<tr>' +
-        '<td style="padding:8px 10px;border-bottom:1px solid #f0f0f0;font-size:12px;color:#1565c0;white-space:nowrap;vertical-align:top">' + a.fecha + '</td>' +
-        '<td style="padding:8px 10px;border-bottom:1px solid #f0f0f0;font-size:13px;vertical-align:top">' + a.descripcion + '</td>' +
-        '<td style="padding:8px 10px;border-bottom:1px solid #f0f0f0;font-size:12px;vertical-align:top;text-align:center">' + linkHtml + '</td>' +
+        '<td style="padding:7px 10px;border-bottom:1px solid #f0f0f0;font-size:12px;color:#1565c0;white-space:nowrap;vertical-align:top">' + (a.fecha || '--') + '</td>' +
+        '<td style="padding:7px 10px;border-bottom:1px solid #f0f0f0;font-size:13px;vertical-align:top">' + a.descripcion + '</td>' +
+        '<td style="padding:7px 10px;border-bottom:1px solid #f0f0f0;font-size:12px;vertical-align:top;text-align:center;width:50px">' + linkHtml + '</td>' +
         '</tr>';
     }).join('');
-
-    const noActsMsg = (!c.actuaciones || !c.actuaciones.length)
-      ? '<tr><td colspan="3" style="padding:8px 10px;font-size:12px;color:#999;font-style:italic">Sin actuaciones detalladas en el periodo</td></tr>'
-      : '';
-
-    return '<div style="margin-bottom:20px;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden">' +
+    const noActs = (!c.actuaciones || !c.actuaciones.length) ? '<tr><td colspan="3" style="padding:8px 10px;font-size:12px;color:#999;font-style:italic">Sin actuaciones en el periodo</td></tr>' : '';
+    return '<div style="margin-bottom:16px;border:1px solid #ddd;border-radius:8px;overflow:hidden">' +
       '<div style="background:#1a237e;padding:10px 14px">' +
-      '<div style="color:white;font-size:13px;font-weight:700">' + (c.caratula || 'Sin carátula') + '</div>' +
-      '<div style="color:rgba(255,255,255,0.7);font-size:11px;margin-top:2px">' + c.setNombre + ' &bull; Causa: ' + c.nidCausa + '</div>' +
+      '<div style="color:white;font-size:13px;font-weight:700">' + (c.caratula || 'Sin caratula') + '</div>' +
+      '<div style="color:rgba(255,255,255,.7);font-size:11px;margin-top:2px">' + c.setNombre + ' - Causa ' + c.nidCausa + '</div>' +
       '</div>' +
       '<table style="width:100%;border-collapse:collapse;background:white">' +
       '<tr style="background:#f5f5f5">' +
-      '<th style="padding:7px 10px;text-align:left;font-size:11px;color:#555;width:90px">FECHA</th>' +
-      '<th style="padding:7px 10px;text-align:left;font-size:11px;color:#555">NOVEDAD</th>' +
-      '<th style="padding:7px 10px;text-align:center;font-size:11px;color:#555;width:100px">DOCUMENTO</th>' +
-      '</tr>' +
-      actRows + noActsMsg +
-      '</table></div>';
+      '<th style="padding:6px 10px;font-size:11px;color:#555;text-align:left;width:90px">FECHA</th>' +
+      '<th style="padding:6px 10px;font-size:11px;color:#555;text-align:left">NOVEDAD</th>' +
+      '<th style="padding:6px 10px;font-size:11px;color:#555;text-align:center;width:50px">DOC</th>' +
+      '</tr>' + actRows + noActs + '</table></div>';
   }).join('');
-
   const html = '<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:750px;margin:0 auto;background:#f0f2f5;padding:20px">' +
     '<div style="background:#1a237e;padding:20px 24px;border-radius:8px 8px 0 0">' +
     '<h2 style="margin:0;color:white;font-size:20px">Novedades MEV</h2>' +
-    '<p style="margin:4px 0 0;color:rgba(255,255,255,0.8);font-size:13px">Período: ' + desde + ' al ' + hasta + '</p></div>' +
+    '<p style="margin:4px 0 0;color:rgba(255,255,255,.8);font-size:13px">Periodo: ' + desde + ' al ' + hasta + '</p></div>' +
     '<div style="background:#e8eaf6;padding:10px 24px;border-radius:0 0 8px 8px;margin-bottom:16px">' +
-    '<span style="font-size:13px;color:#1a237e"><strong>' + causas.length + '</strong> causa' + (causas.length !== 1 ? 's' : '') + ' con novedades</span>' +
-    '</div>' +
+    '<strong>' + causas.length + '</strong> causa' + (causas.length !== 1 ? 's' : '') + ' con novedades</div>' +
     causaBlocks +
-    '<p style="color:#aaa;font-size:11px;text-align:center;margin-top:8px">MEV Monitor &bull; SCBA</p>' +
-    '</body></html>';
-
+    '<p style="color:#aaa;font-size:11px;text-align:center;margin-top:8px">MEV Monitor - SCBA</p></body></html>';
   const resp = await axios.post('https://api.resend.com/emails', {
     from: 'MEV Monitor <onboarding@resend.dev>',
     to: [to],
     subject: 'Novedades MEV - ' + desde + ' al ' + hasta + ' (' + causas.length + ' causas)',
-    html: html
-  }, {
-    headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
-    timeout: 15000
-  });
-
+    html
+  }, { headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' }, timeout: 15000 });
   if (resp.status >= 400) throw new Error('Resend error: ' + JSON.stringify(resp.data));
   console.log('[MEV] Resend OK id: ' + resp.data.id);
 }
