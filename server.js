@@ -66,7 +66,6 @@ function parseSets(html) {
 }
 
 function parseOrganismos(html) {
-  // Parse JuzgadoElegido select from resultados.asp (no-date version)
   const $ = cheerio.load(html);
   const orgs = [];
   $('select[name=JuzgadoElegido] option').each((_, el) => {
@@ -79,18 +78,24 @@ function parseOrganismos(html) {
 function parseResultados(html, setNombre) {
   const $ = cheerio.load(html);
   const causas = [];
-  // checkbox has nidCausa, next hidden has pidJuzgado, next a has caratula
   $('input[type=checkbox]').each((_, cb) => {
     const nidCausa = $(cb).attr('value');
     if (!nidCausa || !nidCausa.trim()) return;
     const hidden = $(cb).next('input[type=hidden]');
     const pidJuzgado = (hidden.attr('value') || '').trim();
     const caratula = hidden.next('a').text().trim();
+    // despacho text format: "10/03/2026 - VISTA - CONTESTA"
     const despachoLink = $(cb).parent().find('a[href*="procesales"]').last();
-    const despacho = despachoLink.text().trim();
+    const despachoText = despachoLink.text().trim();
     const href = despachoLink.attr('href') || '';
     const linkDespacho = href ? (href.startsWith('http') ? href : BASE + '/' + href.replace(/^\//, '')) : '';
-    causas.push({ nidCausa: nidCausa.trim(), pidJuzgado, caratula, setNombre, despacho, linkDespacho });
+
+    // Split despacho into fecha and descripcion
+    const despachoMatch = despachoText.match(/^(\d{2}\/\d{2}\/\d{4})\s*-\s*(.+)$/);
+    const despachoFecha = despachoMatch ? despachoMatch[1] : '';
+    const despachoDesc = despachoMatch ? despachoMatch[2].trim() : despachoText;
+
+    causas.push({ nidCausa: nidCausa.trim(), pidJuzgado, caratula, setNombre, despachoFecha, despachoDesc, linkDespacho });
   });
   return causas;
 }
@@ -101,6 +106,8 @@ function parseDate(s) {
   return m ? new Date(+m[3], +m[2] - 1, +m[1]) : null;
 }
 
+// FIX: procesales.asp has 4 columns: Fecha | Fojas | Firmado | Descripcion
+// td[0]=fecha (with time), td[1]=fojas, td[2]=firmado, td[3]=descripcion+link
 async function getActuaciones(client, nidCausa, pidJuzgado, desde, hasta) {
   const url = BASE + '/procesales.asp?nidCausa=' + nidCausa + '&pidJuzgado=' + encodeURIComponent(pidJuzgado);
   const r = await client.get(url, { timeout: 12000, headers: { 'Referer': BASE + '/resultados.asp' } });
@@ -111,16 +118,28 @@ async function getActuaciones(client, nidCausa, pidJuzgado, desde, hasta) {
   const acts = [];
   $('table tr').each((_, row) => {
     const cells = $(row).find('td');
-    if (cells.length < 2) return;
-    const fecha = cells.eq(0).text().trim();
-    if (!/\d{2}\/\d{2}\/\d{4}/.test(fecha)) return;
+    if (cells.length < 4) return; // need at least 4 columns
+
+    // td[0] = fecha (format: "03/03/2026 18:16:29")
+    const fechaRaw = cells.eq(0).text().trim();
+    const fechaMatch = fechaRaw.match(/(\d{2}\/\d{2}\/\d{4})/);
+    if (!fechaMatch) return;
+    const fecha = fechaMatch[1];
+
     const d = parseDate(fecha);
-    if (!d || (desdeDt && d < desdeDt) || (hastaDt && d > hastaDt)) return;
-    const desc = cells.eq(1).text().trim();
-    if (!desc || desc.includes('Fecha') || desc.includes('Actuacion')) return;
-    const linkEl = cells.eq(1).find('a').first();
+    if (!d) return;
+    if (desdeDt && d < desdeDt) return;
+    if (hastaDt && d > hastaDt) return;
+
+    // td[3] = descripcion with link
+    const descCell = cells.eq(3);
+    const desc = descCell.text().trim();
+    if (!desc || desc === 'Descripcion' || desc === 'Descripci&oacute;n') return;
+
+    const linkEl = descCell.find('a').first();
     const href = linkEl.attr('href') || '';
     const link = href ? (href.startsWith('http') ? href : BASE + '/' + href.replace(/^\//, '')) : '';
+
     acts.push({ fecha, descripcion: desc, link });
   });
   return acts;
@@ -147,10 +166,6 @@ async function scanMEV(opts) {
 
   for (const set of sets) {
     console.log('[MEV] Procesando set: ' + set.nombre);
-
-    // STEP 1: GET resultados with empty dates to:
-    //   a) Set nidset in server session
-    //   b) Get list of organismos for this set
     const urlBase = BASE + '/resultados.asp?nidset=' + set.id + '&sFechaDesde=&sFechaHasta=&pOrden=xCa&pOrdenAD=Asc';
     const r0 = await client.get(urlBase, { headers: { 'Referer': BASE + '/busqueda.asp' } });
     const html0 = (r0.data || '').toString();
@@ -158,7 +173,6 @@ async function scanMEV(opts) {
     console.log('[MEV] ' + set.nombre + ': ' + organismos.length + ' organismos');
     if (!organismos.length) continue;
 
-    // STEP 2: For each organismo, POST resultados with dates and JuzgadoElegido
     for (const org of organismos) {
       try {
         const p = new URLSearchParams();
@@ -172,17 +186,10 @@ async function scanMEV(opts) {
 
         const r = await client.post(postUrl, p.toString(), {
           timeout: 10000,
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Referer': urlBase
-          }
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': urlBase }
         });
         const html = (r.data || '').toString();
-
-        if (html.includes('No arroja resultados') || html.includes('no arroja resultados')) {
-          await sleep(100);
-          continue;
-        }
+        if (html.includes('No arroja resultados')) { await sleep(80); continue; }
 
         const causas = parseResultados(html, set.nombre);
         if (causas.length > 0) {
@@ -196,26 +203,29 @@ async function scanMEV(opts) {
         }
         await sleep(150);
       } catch(e) {
-        console.log('[MEV] skip org ' + org.codigo + ': ' + e.message);
         await sleep(50);
       }
     }
-    console.log('[MEV] ' + set.nombre + ' done. Total acumulado: ' + todasCausas.length);
+    console.log('[MEV] ' + set.nombre + ' done. Acumulado: ' + todasCausas.length);
   }
 
-  console.log('[MEV] Total causas unicas: ' + todasCausas.length);
+  console.log('[MEV] Total causas: ' + todasCausas.length);
   if (!todasCausas.length) return { total: 0, emailEnviado: false };
 
-  // Get actuaciones for each causa
   const resultado = [];
   for (const c of todasCausas) {
     try {
       const acts = await getActuaciones(client, c.nidCausa, c.pidJuzgado, opts.fechaDesde, opts.fechaHasta);
       console.log('[MEV] ' + c.nidCausa + ': ' + acts.length + ' acts');
-      resultado.push({ ...c, actuaciones: acts.length > 0 ? acts : [{ fecha: '', descripcion: c.despacho, link: c.linkDespacho }] });
+      if (acts.length > 0) {
+        resultado.push({ ...c, actuaciones: acts });
+      } else {
+        // Fallback: use despacho from resultados with its parsed fecha/desc
+        resultado.push({ ...c, actuaciones: [{ fecha: c.despachoFecha, descripcion: c.despachoDesc, link: c.linkDespacho }] });
+      }
       await sleep(150);
     } catch(e) {
-      resultado.push({ ...c, actuaciones: [{ fecha: '', descripcion: c.despacho, link: c.linkDespacho }] });
+      resultado.push({ ...c, actuaciones: [{ fecha: c.despachoFecha, descripcion: c.despachoDesc, link: c.linkDespacho }] });
     }
   }
 
@@ -230,7 +240,7 @@ async function sendEmail(causas, to, desde, hasta) {
   const causaBlocks = causas.map(c => {
     const actRows = (c.actuaciones || []).map(a => {
       const linkHtml = a.link ? '<a href="' + a.link + '" style="color:#1565c0;font-weight:600;text-decoration:none" target="_blank">Ver</a>' : '';
-      return '<tr><td style="padding:7px 10px;border-bottom:1px solid #f0f0f0;font-size:12px;color:#1565c0;white-space:nowrap;vertical-align:top">' + (a.fecha || '--') + '</td><td style="padding:7px 10px;border-bottom:1px solid #f0f0f0;font-size:13px;vertical-align:top">' + a.descripcion + '</td><td style="padding:7px 10px;border-bottom:1px solid #f0f0f0;text-align:center;vertical-align:top;width:50px">' + linkHtml + '</td></tr>';
+      return '<tr><td style="padding:7px 10px;border-bottom:1px solid #f0f0f0;font-size:12px;color:#1565c0;white-space:nowrap;vertical-align:top">' + (a.fecha || '--') + '</td><td style="padding:7px 10px;border-bottom:1px solid #f0f0f0;font-size:13px;vertical-align:top">' + (a.descripcion || '') + '</td><td style="padding:7px 10px;border-bottom:1px solid #f0f0f0;text-align:center;vertical-align:top;width:50px">' + linkHtml + '</td></tr>';
     }).join('');
     const noActs = (!c.actuaciones || !c.actuaciones.length) ? '<tr><td colspan="3" style="padding:8px 10px;font-size:12px;color:#999;font-style:italic">Sin actuaciones en el periodo</td></tr>' : '';
     return '<div style="margin-bottom:16px;border:1px solid #ddd;border-radius:8px;overflow:hidden"><div style="background:#1a237e;padding:10px 14px"><div style="color:white;font-size:13px;font-weight:700">' + (c.caratula || 'Sin caratula') + '</div><div style="color:rgba(255,255,255,.7);font-size:11px;margin-top:2px">' + c.setNombre + ' - Causa ' + c.nidCausa + '</div></div><table style="width:100%;border-collapse:collapse;background:white"><tr style="background:#f5f5f5"><th style="padding:6px 10px;font-size:11px;color:#555;text-align:left;width:90px">FECHA</th><th style="padding:6px 10px;font-size:11px;color:#555;text-align:left">NOVEDAD</th><th style="padding:6px 10px;font-size:11px;color:#555;text-align:center;width:50px">DOC</th></tr>' + actRows + noActs + '</table></div>';
