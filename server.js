@@ -65,52 +65,40 @@ function parseSets(html) {
   return sets;
 }
 
-function parseDate(s) {
-  if (!s) return null;
-  const m = s.match(/(\d{2})\/(\d{2})\/(\d{4})/);
-  return m ? new Date(+m[3], +m[2] - 1, +m[1]) : null;
+function parseOrganismos(html) {
+  // Parse JuzgadoElegido select from resultados.asp (no-date version)
+  const $ = cheerio.load(html);
+  const orgs = [];
+  $('select[name=JuzgadoElegido] option').each((_, el) => {
+    const val = $(el).attr('value');
+    if (val && val.trim()) orgs.push({ codigo: val.trim(), nombre: $(el).text().trim() });
+  });
+  return orgs;
 }
 
-// Get ALL causas in a set (no date filter = ignores organismo restriction)
-// Then filter locally by despacho date
-function parseTodasCausas(html, setNombre, desdeDt, hastaDt) {
+function parseResultados(html, setNombre) {
   const $ = cheerio.load(html);
   const causas = [];
+  // checkbox has nidCausa, next hidden has pidJuzgado, next a has caratula
   $('input[type=checkbox]').each((_, cb) => {
     const nidCausa = $(cb).attr('value');
     if (!nidCausa || !nidCausa.trim()) return;
     const hidden = $(cb).next('input[type=hidden]');
     const pidJuzgado = (hidden.attr('value') || '').trim();
     const caratula = hidden.next('a').text().trim();
-
-    // Get ultimo despacho - last procesales link in the row
     const despachoLink = $(cb).parent().find('a[href*="procesales"]').last();
-    const despachoText = despachoLink.text().trim();
+    const despacho = despachoLink.text().trim();
     const href = despachoLink.attr('href') || '';
     const linkDespacho = href ? (href.startsWith('http') ? href : BASE + '/' + href.replace(/^\//, '')) : '';
-
-    // Parse despacho date - format "DD/MM/YYYY - DESCRIPCION"
-    const fechaDespacho = parseDate(despachoText);
-
-    // Filter by date range
-    if (fechaDespacho) {
-      if (desdeDt && fechaDespacho < desdeDt) return;
-      if (hastaDt && fechaDespacho > hastaDt) return;
-    } else {
-      // No date in despacho - skip if we have a date filter
-      if (desdeDt || hastaDt) return;
-    }
-
-    causas.push({
-      nidCausa: nidCausa.trim(),
-      pidJuzgado,
-      caratula,
-      setNombre,
-      despacho: despachoText,
-      linkDespacho
-    });
+    causas.push({ nidCausa: nidCausa.trim(), pidJuzgado, caratula, setNombre, despacho, linkDespacho });
   });
   return causas;
+}
+
+function parseDate(s) {
+  if (!s) return null;
+  const m = s.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+  return m ? new Date(+m[3], +m[2] - 1, +m[1]) : null;
 }
 
 async function getActuaciones(client, nidCausa, pidJuzgado, desde, hasta) {
@@ -154,38 +142,68 @@ async function scanMEV(opts) {
   console.log('[MEV] Sets: ' + sets.map(s => s.nombre).join(', '));
   if (!sets.length) throw new Error('No se encontraron sets');
 
-  const desdeDt = parseDate(opts.fechaDesde);
-  const hastaDt = parseDate(opts.fechaHasta);
-  if (hastaDt) hastaDt.setHours(23, 59, 59);
-
   const todasCausas = [];
   const vistos = new Set();
 
   for (const set of sets) {
-    try {
-      // KEY INSIGHT: use empty dates to get ALL causas regardless of organismo
-      // Then filter by despacho date locally
-      const url = BASE + '/resultados.asp?nidset=' + set.id +
-        '&sFechaDesde=&sFechaHasta=&pOrden=xCa&pOrdenAD=Asc';
-      const r = await client.get(url, { headers: { 'Referer': BASE + '/busqueda.asp' } });
-      const html = (r.data || '').toString();
+    console.log('[MEV] Procesando set: ' + set.nombre);
 
-      const causas = parseTodasCausas(html, set.nombre, desdeDt, hastaDt);
-      console.log('[MEV] ' + set.nombre + ': ' + causas.length + ' causas con novedades en rango');
+    // STEP 1: GET resultados with empty dates to:
+    //   a) Set nidset in server session
+    //   b) Get list of organismos for this set
+    const urlBase = BASE + '/resultados.asp?nidset=' + set.id + '&sFechaDesde=&sFechaHasta=&pOrden=xCa&pOrdenAD=Asc';
+    const r0 = await client.get(urlBase, { headers: { 'Referer': BASE + '/busqueda.asp' } });
+    const html0 = (r0.data || '').toString();
+    const organismos = parseOrganismos(html0);
+    console.log('[MEV] ' + set.nombre + ': ' + organismos.length + ' organismos');
+    if (!organismos.length) continue;
 
-      for (const c of causas) {
-        if (!vistos.has(c.nidCausa)) {
-          vistos.add(c.nidCausa);
-          todasCausas.push(c);
+    // STEP 2: For each organismo, POST resultados with dates and JuzgadoElegido
+    for (const org of organismos) {
+      try {
+        const p = new URLSearchParams();
+        p.append('JuzgadoElegido', org.codigo);
+        p.append('snrointerno', '');
+        p.append('scaratula', '');
+        p.append('menu1', 'resultados.asp?pagina=1&pOrden=xCa&pOrdenAD=Asc&pNroColumna=1');
+
+        const postUrl = BASE + '/resultados.asp?sFechaDesde=' +
+          encodeURIComponent(opts.fechaDesde) + '&sFechaHasta=' + encodeURIComponent(opts.fechaHasta);
+
+        const r = await client.post(postUrl, p.toString(), {
+          timeout: 10000,
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Referer': urlBase
+          }
+        });
+        const html = (r.data || '').toString();
+
+        if (html.includes('No arroja resultados') || html.includes('no arroja resultados')) {
+          await sleep(100);
+          continue;
         }
+
+        const causas = parseResultados(html, set.nombre);
+        if (causas.length > 0) {
+          console.log('[MEV] ' + org.nombre.trim() + ': ' + causas.length + ' causas');
+          for (const c of causas) {
+            if (!vistos.has(c.nidCausa)) {
+              vistos.add(c.nidCausa);
+              todasCausas.push(c);
+            }
+          }
+        }
+        await sleep(150);
+      } catch(e) {
+        console.log('[MEV] skip org ' + org.codigo + ': ' + e.message);
+        await sleep(50);
       }
-      await sleep(300);
-    } catch(e) {
-      console.error('[MEV] Error set ' + set.nombre + ': ' + e.message);
     }
+    console.log('[MEV] ' + set.nombre + ' done. Total acumulado: ' + todasCausas.length);
   }
 
-  console.log('[MEV] Total causas: ' + todasCausas.length);
+  console.log('[MEV] Total causas unicas: ' + todasCausas.length);
   if (!todasCausas.length) return { total: 0, emailEnviado: false };
 
   // Get actuaciones for each causa
@@ -193,9 +211,9 @@ async function scanMEV(opts) {
   for (const c of todasCausas) {
     try {
       const acts = await getActuaciones(client, c.nidCausa, c.pidJuzgado, opts.fechaDesde, opts.fechaHasta);
-      console.log('[MEV] ' + c.nidCausa + ': ' + acts.length + ' actuaciones');
+      console.log('[MEV] ' + c.nidCausa + ': ' + acts.length + ' acts');
       resultado.push({ ...c, actuaciones: acts.length > 0 ? acts : [{ fecha: '', descripcion: c.despacho, link: c.linkDespacho }] });
-      await sleep(200);
+      await sleep(150);
     } catch(e) {
       resultado.push({ ...c, actuaciones: [{ fecha: '', descripcion: c.despacho, link: c.linkDespacho }] });
     }
