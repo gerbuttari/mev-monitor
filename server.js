@@ -231,14 +231,18 @@ async function sendEmail(causas, to, desde, hasta) {
     return '<div style="margin-bottom:16px;border:1px solid #ddd;border-radius:8px;overflow:hidden"><div style="background:#1a237e;padding:10px 14px"><div style="color:white;font-size:13px;font-weight:700">' + (c.caratula || 'Sin caratula') + '</div><div style="color:rgba(255,255,255,.7);font-size:11px;margin-top:2px">' + c.setNombre + ' - Causa ' + c.nidCausa + '</div></div><table style="width:100%;border-collapse:collapse;background:white"><tr style="background:#f5f5f5"><th style="padding:6px 10px;font-size:11px;color:#555;text-align:left;width:90px">FECHA</th><th style="padding:6px 10px;font-size:11px;color:#555;text-align:left">NOVEDAD</th><th style="padding:6px 10px;font-size:11px;color:#555;text-align:center;width:50px">DOC</th></tr>' + actRows + noActs + '</table></div>';
   }).join('');
   const html = '<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:750px;margin:0 auto;background:#f0f2f5;padding:20px"><div style="background:#1a237e;padding:20px 24px;border-radius:8px 8px 0 0"><h2 style="margin:0;color:white;font-size:20px">Novedades MEV</h2><p style="margin:4px 0 0;color:rgba(255,255,255,.8);font-size:13px">Periodo: ' + desde + ' al ' + hasta + '</p></div><div style="background:#e8eaf6;padding:10px 24px;border-radius:0 0 8px 8px;margin-bottom:16px"><strong>' + causas.length + '</strong> causa' + (causas.length !== 1 ? 's' : '') + ' con novedades</div>' + causaBlocks + '<p style="color:#aaa;font-size:11px;text-align:center;margin-top:8px">MEV Monitor - SCBA</p></body></html>';
+  // Resend free plan: send one email per recipient
+  const recipients = to.split(',').map(s => s.trim()).filter(Boolean);
+  for (const recipient of recipients) {
   const resp = await axios.post('https://api.resend.com/emails', {
     from: 'MEV Monitor <onboarding@resend.dev>',
-    to: [to],
+    to: [recipient],
     subject: 'Novedades MEV - ' + desde + ' al ' + hasta + ' (' + causas.length + ' causas)',
     html
   }, { headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' }, timeout: 15000 });
   if (resp.status >= 400) throw new Error('Resend error: ' + JSON.stringify(resp.data));
   console.log('[MEV] Resend OK id: ' + resp.data.id);
+  } // end recipients loop
 }
 
 const jobs = {};
