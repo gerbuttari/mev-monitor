@@ -234,14 +234,21 @@ async function sendEmail(causas, to, desde, hasta) {
   // Resend free plan: send one email per recipient
   const recipients = to.split(',').map(s => s.trim()).filter(Boolean);
   for (const recipient of recipients) {
-  const resp = await axios.post('https://api.resend.com/emails', {
-    from: 'MEV Monitor <onboarding@resend.dev>',
-    to: [recipient],
-    subject: 'Novedades MEV - ' + desde + ' al ' + hasta + ' (' + causas.length + ' causas)',
-    html
-  }, { headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' }, timeout: 15000 });
-  if (resp.status >= 400) throw new Error('Resend error: ' + JSON.stringify(resp.data));
-  console.log('[MEV] Resend OK id: ' + resp.data.id);
+    try {
+      const resp = await axios.post('https://api.resend.com/emails', {
+        from: 'MEV Monitor <onboarding@resend.dev>',
+        to: [recipient],
+        subject: 'Novedades MEV - ' + desde + ' al ' + hasta + ' (' + causas.length + ' causas)',
+        html
+      }, { headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' }, timeout: 15000 });
+      if (resp.status >= 400) {
+        console.log('[MEV] Resend skip ' + recipient + ': ' + resp.status + ' ' + JSON.stringify(resp.data).substring(0,100));
+      } else {
+        console.log('[MEV] Resend OK ' + recipient + ' id: ' + resp.data.id);
+      }
+    } catch(e) {
+      console.log('[MEV] Resend error ' + recipient + ': ' + e.message);
+    }
   } // end recipients loop
 }
 
