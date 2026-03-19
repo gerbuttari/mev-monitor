@@ -84,17 +84,14 @@ function parseResultados(html, setNombre) {
     const hidden = $(cb).next('input[type=hidden]');
     const pidJuzgado = (hidden.attr('value') || '').trim();
     const caratula = hidden.next('a').text().trim();
-    // despacho text format: "10/03/2026 - VISTA - CONTESTA"
     const despachoLink = $(cb).parent().find('a[href*="procesales"]').last();
     const despachoText = despachoLink.text().trim();
     const href = despachoLink.attr('href') || '';
     const linkDespacho = href ? (href.startsWith('http') ? href : BASE + '/' + href.replace(/^\//, '')) : '';
-
-    // Split despacho into fecha and descripcion
-    const despachoMatch = despachoText.match(/^(\d{2}\/\d{2}\/\d{4})\s*-\s*(.+)$/);
-    const despachoFecha = despachoMatch ? despachoMatch[1] : '';
-    const despachoDesc = despachoMatch ? despachoMatch[2].trim() : despachoText;
-
+    // Split "10/03/2026 - VISTA - CONTESTA" into fecha and desc
+    const m = despachoText.match(/^(\d{2}\/\d{2}\/\d{4})\s*-\s*(.+)$/);
+    const despachoFecha = m ? m[1] : '';
+    const despachoDesc = m ? m[2].trim() : despachoText;
     causas.push({ nidCausa: nidCausa.trim(), pidJuzgado, caratula, setNombre, despachoFecha, despachoDesc, linkDespacho });
   });
   return causas;
@@ -106,8 +103,9 @@ function parseDate(s) {
   return m ? new Date(+m[3], +m[2] - 1, +m[1]) : null;
 }
 
-// FIX: procesales.asp has 4 columns: Fecha | Fojas | Firmado | Descripcion
-// td[0]=fecha (with time), td[1]=fojas, td[2]=firmado, td[3]=descripcion+link
+// procesales.asp structure: 4 columns per data row
+// td[0]=Fecha (DD/MM/YYYY HH:MM:SS), td[1]=Fojas, td[2]=Firmado, td[3]=Descripcion+link
+// KEY FIX: use find('> td') to get DIRECT children only, avoiding nested table tds
 async function getActuaciones(client, nidCausa, pidJuzgado, desde, hasta) {
   const url = BASE + '/procesales.asp?nidCausa=' + nidCausa + '&pidJuzgado=' + encodeURIComponent(pidJuzgado);
   const r = await client.get(url, { timeout: 12000, headers: { 'Referer': BASE + '/resultados.asp' } });
@@ -117,31 +115,28 @@ async function getActuaciones(client, nidCausa, pidJuzgado, desde, hasta) {
   if (hastaDt) hastaDt.setHours(23, 59, 59);
   const acts = [];
   $('table tr').each((_, row) => {
-    const cells = $(row).find('td');
-    if (cells.length < 4) return; // need at least 4 columns
-
-    // td[0] = fecha (format: "03/03/2026 18:16:29")
+    // Use '> td' to get ONLY direct child tds (not nested table tds)
+    const cells = $(row).find('> td');
+    if (cells.length !== 4) return;
+    // td[0] = fecha with time: "03/03/2026 18:16:29"
     const fechaRaw = cells.eq(0).text().trim();
     const fechaMatch = fechaRaw.match(/(\d{2}\/\d{2}\/\d{4})/);
     if (!fechaMatch) return;
     const fecha = fechaMatch[1];
-
     const d = parseDate(fecha);
     if (!d) return;
     if (desdeDt && d < desdeDt) return;
     if (hastaDt && d > hastaDt) return;
-
-    // td[3] = descripcion with link
+    // td[3] = descripcion + link
     const descCell = cells.eq(3);
     const desc = descCell.text().trim();
-    if (!desc || desc === 'Descripcion' || desc === 'Descripci&oacute;n') return;
-
+    if (!desc || desc === 'Descripcion' || desc === 'Descripci\u00f3n' || desc === 'Fecha') return;
     const linkEl = descCell.find('a').first();
     const href = linkEl.attr('href') || '';
     const link = href ? (href.startsWith('http') ? href : BASE + '/' + href.replace(/^\//, '')) : '';
-
     acts.push({ fecha, descripcion: desc, link });
   });
+  console.log('[MEV] procesales ' + nidCausa + ': ' + acts.length + ' acts en rango');
   return acts;
 }
 
@@ -165,7 +160,7 @@ async function scanMEV(opts) {
   const vistos = new Set();
 
   for (const set of sets) {
-    console.log('[MEV] Procesando set: ' + set.nombre);
+    console.log('[MEV] Set: ' + set.nombre);
     const urlBase = BASE + '/resultados.asp?nidset=' + set.id + '&sFechaDesde=&sFechaHasta=&pOrden=xCa&pOrdenAD=Asc';
     const r0 = await client.get(urlBase, { headers: { 'Referer': BASE + '/busqueda.asp' } });
     const html0 = (r0.data || '').toString();
@@ -180,31 +175,23 @@ async function scanMEV(opts) {
         p.append('snrointerno', '');
         p.append('scaratula', '');
         p.append('menu1', 'resultados.asp?pagina=1&pOrden=xCa&pOrdenAD=Asc&pNroColumna=1');
-
         const postUrl = BASE + '/resultados.asp?sFechaDesde=' +
           encodeURIComponent(opts.fechaDesde) + '&sFechaHasta=' + encodeURIComponent(opts.fechaHasta);
-
         const r = await client.post(postUrl, p.toString(), {
           timeout: 10000,
           headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': urlBase }
         });
         const html = (r.data || '').toString();
         if (html.includes('No arroja resultados')) { await sleep(80); continue; }
-
         const causas = parseResultados(html, set.nombre);
         if (causas.length > 0) {
           console.log('[MEV] ' + org.nombre.trim() + ': ' + causas.length + ' causas');
           for (const c of causas) {
-            if (!vistos.has(c.nidCausa)) {
-              vistos.add(c.nidCausa);
-              todasCausas.push(c);
-            }
+            if (!vistos.has(c.nidCausa)) { vistos.add(c.nidCausa); todasCausas.push(c); }
           }
         }
         await sleep(150);
-      } catch(e) {
-        await sleep(50);
-      }
+      } catch(e) { await sleep(50); }
     }
     console.log('[MEV] ' + set.nombre + ' done. Acumulado: ' + todasCausas.length);
   }
@@ -216,11 +203,9 @@ async function scanMEV(opts) {
   for (const c of todasCausas) {
     try {
       const acts = await getActuaciones(client, c.nidCausa, c.pidJuzgado, opts.fechaDesde, opts.fechaHasta);
-      console.log('[MEV] ' + c.nidCausa + ': ' + acts.length + ' acts');
       if (acts.length > 0) {
         resultado.push({ ...c, actuaciones: acts });
       } else {
-        // Fallback: use despacho from resultados with its parsed fecha/desc
         resultado.push({ ...c, actuaciones: [{ fecha: c.despachoFecha, descripcion: c.despachoDesc, link: c.linkDespacho }] });
       }
       await sleep(150);
