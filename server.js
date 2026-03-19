@@ -15,7 +15,7 @@ const BASE = 'https://mev.scba.gov.ar';
 function createClient() {
   const jar = new CookieJar();
   return wrapper(axios.create({
-    jar, withCredentials: true, timeout: 20000, maxRedirects: 10,
+    jar, withCredentials: true, timeout: 15000, maxRedirects: 10,
     validateStatus: () => true,
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
@@ -88,7 +88,6 @@ function parseResultados(html, setNombre) {
     const despachoText = despachoLink.text().trim();
     const href = despachoLink.attr('href') || '';
     const linkDespacho = href ? (href.startsWith('http') ? href : BASE + '/' + href.replace(/^\//, '')) : '';
-    // Split "10/03/2026 - VISTA - CONTESTA" into fecha and desc
     const m = despachoText.match(/^(\d{2}\/\d{2}\/\d{4})\s*-\s*(.+)$/);
     const despachoFecha = m ? m[1] : '';
     const despachoDesc = m ? m[2].trim() : despachoText;
@@ -103,22 +102,20 @@ function parseDate(s) {
   return m ? new Date(+m[3], +m[2] - 1, +m[1]) : null;
 }
 
-// procesales.asp structure: 4 columns per data row
-// td[0]=Fecha (DD/MM/YYYY HH:MM:SS), td[1]=Fojas, td[2]=Firmado, td[3]=Descripcion+link
-// KEY FIX: use find('> td') to get DIRECT children only, avoiding nested table tds
+// procesales.asp: 4 cols per data row: Fecha | Fojas | Firmado | Descripcion+link
+// Use '> td' to get direct children only, avoiding nested table tds
 async function getActuaciones(client, nidCausa, pidJuzgado, desde, hasta) {
   const url = BASE + '/procesales.asp?nidCausa=' + nidCausa + '&pidJuzgado=' + encodeURIComponent(pidJuzgado);
-  const r = await client.get(url, { timeout: 12000, headers: { 'Referer': BASE + '/resultados.asp' } });
+  // Short timeout - if MEV doesn't respond quickly, use fallback
+  const r = await client.get(url, { timeout: 8000, headers: { 'Referer': BASE + '/resultados.asp' } });
   const $ = cheerio.load(r.data || '');
   const desdeDt = parseDate(desde);
   const hastaDt = parseDate(hasta);
   if (hastaDt) hastaDt.setHours(23, 59, 59);
   const acts = [];
   $('table tr').each((_, row) => {
-    // Use '> td' to get ONLY direct child tds (not nested table tds)
     const cells = $(row).find('> td');
     if (cells.length !== 4) return;
-    // td[0] = fecha with time: "03/03/2026 18:16:29"
     const fechaRaw = cells.eq(0).text().trim();
     const fechaMatch = fechaRaw.match(/(\d{2}\/\d{2}\/\d{4})/);
     if (!fechaMatch) return;
@@ -127,16 +124,14 @@ async function getActuaciones(client, nidCausa, pidJuzgado, desde, hasta) {
     if (!d) return;
     if (desdeDt && d < desdeDt) return;
     if (hastaDt && d > hastaDt) return;
-    // td[3] = descripcion + link
     const descCell = cells.eq(3);
     const desc = descCell.text().trim();
-    if (!desc || desc === 'Descripcion' || desc === 'Descripci\u00f3n' || desc === 'Fecha') return;
+    if (!desc || desc === 'Descripcion' || desc === 'Fecha') return;
     const linkEl = descCell.find('a').first();
     const href = linkEl.attr('href') || '';
     const link = href ? (href.startsWith('http') ? href : BASE + '/' + href.replace(/^\//, '')) : '';
     acts.push({ fecha, descripcion: desc, link });
   });
-  console.log('[MEV] procesales ' + nidCausa + ': ' + acts.length + ' acts en rango');
   return acts;
 }
 
@@ -163,8 +158,7 @@ async function scanMEV(opts) {
     console.log('[MEV] Set: ' + set.nombre);
     const urlBase = BASE + '/resultados.asp?nidset=' + set.id + '&sFechaDesde=&sFechaHasta=&pOrden=xCa&pOrdenAD=Asc';
     const r0 = await client.get(urlBase, { headers: { 'Referer': BASE + '/busqueda.asp' } });
-    const html0 = (r0.data || '').toString();
-    const organismos = parseOrganismos(html0);
+    const organismos = parseOrganismos((r0.data || '').toString());
     console.log('[MEV] ' + set.nombre + ': ' + organismos.length + ' organismos');
     if (!organismos.length) continue;
 
@@ -178,7 +172,7 @@ async function scanMEV(opts) {
         const postUrl = BASE + '/resultados.asp?sFechaDesde=' +
           encodeURIComponent(opts.fechaDesde) + '&sFechaHasta=' + encodeURIComponent(opts.fechaHasta);
         const r = await client.post(postUrl, p.toString(), {
-          timeout: 10000,
+          timeout: 8000,
           headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': urlBase }
         });
         const html = (r.data || '').toString();
@@ -190,8 +184,11 @@ async function scanMEV(opts) {
             if (!vistos.has(c.nidCausa)) { vistos.add(c.nidCausa); todasCausas.push(c); }
           }
         }
-        await sleep(150);
-      } catch(e) { await sleep(50); }
+        await sleep(100);
+      } catch(e) {
+        // timeout or error on this organismo - skip silently
+        await sleep(50);
+      }
     }
     console.log('[MEV] ' + set.nombre + ' done. Acumulado: ' + todasCausas.length);
   }
@@ -199,19 +196,22 @@ async function scanMEV(opts) {
   console.log('[MEV] Total causas: ' + todasCausas.length);
   if (!todasCausas.length) return { total: 0, emailEnviado: false };
 
+  // Get actuaciones - with short timeout, use fallback if fails
   const resultado = [];
   for (const c of todasCausas) {
+    let acts = [];
     try {
-      const acts = await getActuaciones(client, c.nidCausa, c.pidJuzgado, opts.fechaDesde, opts.fechaHasta);
-      if (acts.length > 0) {
-        resultado.push({ ...c, actuaciones: acts });
-      } else {
-        resultado.push({ ...c, actuaciones: [{ fecha: c.despachoFecha, descripcion: c.despachoDesc, link: c.linkDespacho }] });
-      }
-      await sleep(150);
+      acts = await getActuaciones(client, c.nidCausa, c.pidJuzgado, opts.fechaDesde, opts.fechaHasta);
+      console.log('[MEV] ' + c.nidCausa + ': ' + acts.length + ' acts');
     } catch(e) {
+      console.log('[MEV] ' + c.nidCausa + ' procesales timeout, usando fallback');
+    }
+    if (acts.length > 0) {
+      resultado.push({ ...c, actuaciones: acts });
+    } else {
       resultado.push({ ...c, actuaciones: [{ fecha: c.despachoFecha, descripcion: c.despachoDesc, link: c.linkDespacho }] });
     }
+    await sleep(100);
   }
 
   await sendEmail(resultado, opts.emailDestino, opts.fechaDesde, opts.fechaHasta);
