@@ -240,7 +240,7 @@ async function sendEmail(causas, to, desde, hasta) {
         to: [recipient],
         subject: 'Novedades MEV - ' + desde + ' al ' + hasta + ' (' + causas.length + ' causas)',
         html
-      }, { headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' }, timeout: 15000 });
+      }, { headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' }, timeout: 30000 });
       if (resp.status >= 400) {
         console.log('[MEV] Resend skip ' + recipient + ': ' + resp.status + ' ' + JSON.stringify(resp.data).substring(0,100));
       } else {
